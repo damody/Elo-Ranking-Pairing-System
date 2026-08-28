@@ -1,0 +1,63 @@
+//! Read-only sharded candidate generation and deterministic commit.
+pub mod bucket;
+pub mod claim;
+pub mod dispatcher;
+pub mod five_v_five;
+pub mod free_for_all;
+pub mod one_v_one;
+pub mod snapshot;
+
+use crate::{
+    components::QueueMode,
+    id::{PartyId, PlayerId, TicketId},
+};
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartyTicket {
+    pub id: TicketId,
+    pub party: PartyId,
+    pub members: Vec<PlayerId>,
+    pub ratings: Vec<i32>,
+    pub effective_rating: i32,
+    pub enqueued_at: u64,
+    pub revision: u64,
+    pub region: String,
+    pub mode: QueueMode,
+    pub search_delta: i32,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Candidate {
+    pub tickets: Vec<TicketId>,
+    pub teams: Vec<Vec<PlayerId>>,
+    pub oldest_enqueued_at: u64,
+    pub quality_key: (i32, i32, i32),
+    pub owner_shard: u64,
+}
+impl Candidate {
+    pub fn stable_ticket_ids(&self) -> Vec<TicketId> {
+        let mut ids = self.tickets.clone();
+        ids.sort();
+        ids
+    }
+}
+pub fn effective_rating(
+    ratings: &[i32],
+    size_adjustment: i32,
+    spread_adjustment: i32,
+    max_spread: i32,
+) -> Option<i32> {
+    if ratings.is_empty() {
+        return None;
+    }
+    let min = *ratings.iter().min()?;
+    let max = *ratings.iter().max()?;
+    let spread = i64::from(max) - i64::from(min);
+    if spread > i64::from(max_spread) {
+        return None;
+    }
+    let average =
+        ratings.iter().map(|rating| i64::from(*rating)).sum::<i64>() / ratings.len() as i64;
+    let adjusted = average
+        + i64::from(size_adjustment) * (ratings.len() as i64 - 1)
+        + i64::from(spread_adjustment) * spread / 100;
+    Some(adjusted.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)
+}

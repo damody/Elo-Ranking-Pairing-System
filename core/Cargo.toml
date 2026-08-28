@@ -1,0 +1,53 @@
+[package]
+name = "erps"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "erps"
+
+[[bin]]
+name = "erps-server"
+path = "src/bin/erps-server.rs"
+
+[[bin]]
+name = "erps-load-test"
+path = "src/bin/erps-load-test.rs"
+
+[[bin]]
+name = "erps-test-fixture"
+path = "src/bin/erps-test-fixture.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+crossbeam-channel.workspace = true
+erps-proto = { path = "../proto" }
+erps-client = { path = "../client" }
+parking_lot.workspace = true
+opentelemetry = { workspace = true, optional = true }
+rand.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+specs = { path = "../../specs", features = ["derive", "parallel", "serde"] }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+toml.workspace = true
+tonic.workspace = true
+tonic-health.workspace = true
+tracing.workspace = true
+unicode-normalization.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+rcgen = "0.13"
+serde_json.workspace = true
+tempfile = "3"
+
+[features]
+default = []
+otel = ["dep:opentelemetry"]

@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = ["core", "proto", "client", "client-ffi"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+crossbeam-channel = "0.5"
+futures = "0.3"
+parking_lot = "0.12"
+opentelemetry = "0.32"
+prost = "0.13"
+proptest = "1"
+rand = "0.9"
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
+toml = "0.9"
+tonic = { version = "0.12", features = ["tls"] }
+tonic-health = "0.12"
+tracing = "0.1"
+unicode-normalization = "0.1"
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[profile.release]
+debug = "none"
+split-debuginfo = "off"
+
+[profile.release.build-override]
+debug = "none"

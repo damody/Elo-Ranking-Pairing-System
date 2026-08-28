@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package erps.v1;
+
+message ApiVersion { uint32 major = 1; uint32 minor = 2; repeated string capabilities = 3; }
+message MutationMeta { ApiVersion api = 1; string request_id = 2; string session_token = 3; }
+message AdminSnapshotRequest { ApiVersion api = 1; }
+enum QueueMode { QUEUE_MODE_UNSPECIFIED = 0; QUEUE_MODE_ONE_V_ONE = 1; QUEUE_MODE_FIVE_V_FIVE = 2; QUEUE_MODE_FREE_FOR_ALL = 3; }
+
+message ConnectRequest { ApiVersion api = 1; string auth_token = 2; }
+message ConnectResponse { string session_token = 1; string player_id = 2; ApiVersion api = 3; }
+message CreatePartyRequest { MutationMeta meta = 1; string name = 2; }
+message PartyRequest { MutationMeta meta = 1; string party_id = 2; uint64 revision = 3; }
+message InviteRequest { MutationMeta meta = 1; string party_id = 2; uint64 revision = 3; uint32 ttl_seconds = 4; uint32 uses = 5; }
+message InviteResponse { string token = 1; int64 expires_at_ms = 2; }
+message JoinPartyRequest { MutationMeta meta = 1; string invite_token = 2; }
+message RenamePartyRequest { MutationMeta meta = 1; string party_id = 2; uint64 revision = 3; string name = 4; }
+message MemberRequest { MutationMeta meta = 1; string party_id = 2; uint64 revision = 3; string player_id = 4; }
+message EnqueueRequest { MutationMeta meta = 1; string party_id = 2; uint64 revision = 3; QueueMode mode = 4; repeated string allowed_regions = 5; }
+message ProposalResponseRequest { MutationMeta meta = 1; string proposal_id = 2; }
+message StateRequest { string session_token = 1; ApiVersion api = 2; }
+message WatchEventsRequest { string session_token = 1; ApiVersion api = 2; }
+message OperationResult { bool accepted = 1; string code = 2; string message = 3; string entity_id = 4; uint64 revision = 5; }
+message PlayerView { string player_id = 1; int32 rating = 2; uint32 credit = 3; }
+message PartyView { string party_id = 1; string name = 2; string leader_id = 3; repeated PlayerView members = 4; uint64 revision = 5; string state = 6; }
+message ClientState { string player_id = 1; PartyView party = 2; string ticket_id = 3; string proposal_id = 4; string match_id = 5; }
+message MatchEvent { string match_id = 1; QueueMode mode = 2; repeated Team teams = 3; string endpoint = 4; string connection_token = 5; }
+message Team { uint32 team_index = 1; repeated string player_ids = 2; }
+message ClientEvent { oneof event { PartyView party = 1; string proposal_id = 2; MatchEvent matched = 3; string server_lost_match_id = 4; ClientState state = 5; } int64 deadline_ms = 10; }
+
+message RegisterServerRequest { ApiVersion api = 1; string auth_token = 2; string server_id = 3; uint64 generation = 4; string endpoint = 5; string region = 6; uint32 capacity_total = 7; uint32 max_instances = 8; repeated ModeCost mode_costs = 9; repeated InstanceState instances = 10; string server_class = 11; }
+message ModeCost { QueueMode mode = 1; uint32 cost = 2; }
+message InstanceState { string match_id = 1; string state = 2; uint32 reserved_cost = 3; string endpoint = 4; string connection_token = 5; }
+message RegisterServerResponse { bool accepted = 1; string code = 2; }
+message ServerControl { string server_id = 1; uint64 generation = 2; oneof message { Heartbeat heartbeat = 3; LaunchResult launch_result = 4; InstanceState instance = 5; MatchResult match_result = 6; } string auth_token = 7; ApiVersion api = 8; }
+message Heartbeat { uint32 capacity_used = 1; uint32 running_instances = 2; }
+message LaunchResult { string match_id = 1; string state = 2; string endpoint = 3; string connection_token = 4; string reason = 5; }
+message PlayerPlacement { string player_id = 1; uint32 rank = 2; }
+message MatchResult { string match_id = 1; repeated PlayerPlacement placements = 2; }
+message ErpsControl { oneof message { LaunchMatch launch = 1; string shutdown_reason = 2; string match_result_ack = 3; } }
+message LaunchMatch { string match_id = 1; QueueMode mode = 2; repeated Team teams = 3; uint32 reserved_cost = 4; }
+message ReconcileRequest { string server_id = 1; uint64 generation = 2; repeated InstanceState instances = 3; string auth_token = 4; ApiVersion api = 5; }
+message ServerList { repeated ServerSummary servers = 1; }
+message ServerSummary { string server_id = 1; string health = 2; uint32 capacity_total = 3; uint32 capacity_used = 4; uint32 max_instances = 5; uint32 running_instances = 6; }
+message QueueSummary { QueueMode mode = 1; string region = 2; uint64 tickets = 3; uint64 players = 4; }
+message LatencySummary { string stage = 1; uint64 samples = 2; uint64 p50_us = 3; uint64 p95_us = 4; uint64 p99_us = 5; }
+message MetricSummary {
+  uint64 commands = 1;
+  uint64 proposals = 2;
+  uint64 ready_accepts = 3;
+  uint64 ready_rejects = 4;
+  uint64 ready_timeouts = 5;
+  uint64 credit_penalties = 6;
+  uint64 launch_failures = 7;
+  uint64 reconnects = 8;
+  uint64 invariant_failures = 9;
+  uint64 command_queue_high = 10;
+  uint64 event_queue_high = 11;
+  uint64 control_queue_high = 12;
+  uint64 elo_quality_sum = 13;
+  uint64 party_structure_difference_sum = 14;
+  repeated LatencySummary latencies = 15;
+}
+message AdminSnapshot { repeated QueueSummary queues = 1; ServerList servers = 2; uint64 matches = 3; uint64 reservations = 4; MetricSummary metrics = 5; }
+
+service MatchmakingService {
+  rpc OpenSession(ConnectRequest) returns (ConnectResponse);
+  rpc CreateParty(CreatePartyRequest) returns (OperationResult);
+  rpc CreateInvite(InviteRequest) returns (InviteResponse);
+  rpc JoinParty(JoinPartyRequest) returns (OperationResult);
+  rpc LeaveParty(PartyRequest) returns (OperationResult);
+  rpc KickMember(MemberRequest) returns (OperationResult);
+  rpc RenameParty(RenamePartyRequest) returns (OperationResult);
+  rpc Enqueue(EnqueueRequest) returns (OperationResult);
+  rpc CancelQueue(PartyRequest) returns (OperationResult);
+  rpc AcceptMatch(ProposalResponseRequest) returns (OperationResult);
+  rpc RejectMatch(ProposalResponseRequest) returns (OperationResult);
+  rpc GetState(StateRequest) returns (ClientState);
+  rpc WatchEvents(WatchEventsRequest) returns (stream ClientEvent);
+}
+service GameServerService {
+  rpc Register(RegisterServerRequest) returns (RegisterServerResponse);
+  rpc ControlStream(stream ServerControl) returns (stream ErpsControl);
+  rpc ReconcileInstances(ReconcileRequest) returns (RegisterServerResponse);
+}
+service AdminService { rpc Snapshot(AdminSnapshotRequest) returns (AdminSnapshot); }
