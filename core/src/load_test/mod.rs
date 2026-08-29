@@ -20,6 +20,40 @@ use std::{
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 
+struct ProcessMemorySampler {
+    system: sysinfo::System,
+    pid: sysinfo::Pid,
+    peak_bytes: u64,
+}
+
+impl ProcessMemorySampler {
+    fn new() -> Result<Self, String> {
+        let pid = sysinfo::get_current_pid().map_err(|e| e.to_string())?;
+        let mut sampler = Self {
+            system: sysinfo::System::new(),
+            pid,
+            peak_bytes: 0,
+        };
+        sampler.sample()?;
+        Ok(sampler)
+    }
+
+    fn sample(&mut self) -> Result<(), String> {
+        self.system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[self.pid]),
+            true,
+            sysinfo::ProcessRefreshKind::nothing().with_memory(),
+        );
+        let bytes = self
+            .system
+            .process(self.pid)
+            .ok_or("current process missing from OS process table")?
+            .memory();
+        self.peak_bytes = self.peak_bytes.max(bytes);
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ScenarioConfig {
     pub players: usize,
@@ -175,6 +209,9 @@ pub struct TransportReport {
     pub elapsed_ms: u128,
     pub rust_sdk: bool,
     pub game_server_stream: bool,
+    pub fleet_servers: usize,
+    pub servers_used: usize,
+    pub regions_used: usize,
 }
 
 #[derive(Clone)]
@@ -405,8 +442,13 @@ pub fn run(config: ScenarioConfig) -> Result<LoadReport, String> {
     if config.players < 20 {
         return Err("players must be at least 20".into());
     }
+    if config.workers == 0 {
+        return Err("workers must be greater than zero".into());
+    }
     let started = Instant::now();
+    let mut memory_sampler = ProcessMemorySampler::new()?;
     let parties = materialize_through_ecs(&generate(&config));
+    memory_sampler.sample()?;
     let party_count = parties.len();
     let servers = fleet(config.seed);
     let mut registry = runtime_registry(&servers);
@@ -529,6 +571,9 @@ pub fn run(config: ScenarioConfig) -> Result<LoadReport, String> {
                         .wrapping_add(p.rating as u64)
                         .wrapping_add(p.id.as_uuid().as_u128() as u64);
                     matches += 1;
+                    if matches.is_multiple_of(256) {
+                        memory_sampler.sample()?;
+                    }
                     placement::transition(
                         &mut registry,
                         server_id,
@@ -591,6 +636,7 @@ pub fn run(config: ScenarioConfig) -> Result<LoadReport, String> {
             .copied()
             .unwrap_or_default()
     };
+    memory_sampler.sample()?;
     let report = LoadReport {
         status: if failures == 0 { "PASS" } else { "FAIL" },
         players: config.players,
@@ -615,9 +661,7 @@ pub fn run(config: ScenarioConfig) -> Result<LoadReport, String> {
         ready_timeouts: timeout_count,
         server_cycles: server_cycle_count,
         completed_matches: matches as u64,
-        memory_high_watermark_bytes: (party_count * std::mem::size_of::<Party>()
-            + config.players * std::mem::size_of::<PlayerId>())
-            as u64,
+        memory_high_watermark_bytes: memory_sampler.peak_bytes,
         p50_us: percentile(50),
         p95_us: percentile(95),
         p99_us: percentile(99),
@@ -655,6 +699,59 @@ pub fn run(config: ScenarioConfig) -> Result<LoadReport, String> {
 }
 
 /// Executes the same ready/placement invariants through real loopback gRPC.
+fn validate_grpc_launch(
+    mode: QueueMode,
+    launch: &pb::LaunchMatch,
+    parties: &[Vec<String>],
+) -> Result<(), String> {
+    let expected_mode = match mode {
+        QueueMode::OneVsOne => pb::QueueMode::OneVOne,
+        QueueMode::FiveVsFive => pb::QueueMode::FiveVFive,
+        QueueMode::FreeForAll => pb::QueueMode::FreeForAll,
+    } as i32;
+    if launch.mode != expected_mode {
+        return Err("gRPC launch mode mismatch".into());
+    }
+    let expected_shape: &[usize] = match mode {
+        QueueMode::OneVsOne => &[1, 1],
+        QueueMode::FiveVsFive => &[5, 5],
+        QueueMode::FreeForAll => &[1, 1, 1, 1, 1, 1, 1, 1],
+    };
+    let actual_shape: Vec<_> = launch
+        .teams
+        .iter()
+        .map(|team| team.player_ids.len())
+        .collect();
+    if actual_shape != expected_shape {
+        return Err(format!(
+            "gRPC launch team shape mismatch: expected {expected_shape:?}, got {actual_shape:?}"
+        ));
+    }
+    let mut expected_players: Vec<_> = parties.iter().flatten().cloned().collect();
+    let mut actual_players: Vec<_> = launch
+        .teams
+        .iter()
+        .flat_map(|team| team.player_ids.iter().cloned())
+        .collect();
+    expected_players.sort();
+    actual_players.sort();
+    if actual_players != expected_players {
+        return Err("gRPC launch roster contains missing, duplicate, or foreign players".into());
+    }
+    if mode == QueueMode::FiveVsFive {
+        for party in parties {
+            if !launch
+                .teams
+                .iter()
+                .any(|team| party.iter().all(|player| team.player_ids.contains(player)))
+            {
+                return Err("gRPC launch split a 5v5 party across teams".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn run_grpc(config: &ScenarioConfig) -> Result<TransportReport, String> {
     let started = Instant::now();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
@@ -676,89 +773,81 @@ pub async fn run_grpc(config: &ScenarioConfig) -> Result<TransportReport, String
     let mut game = GameServerServiceClient::connect(endpoint.clone())
         .await
         .map_err(|e| e.to_string())?;
-    let server_id = ServerId::from_uuid(uuid::Uuid::from_u128(config.seed as u128 + 1)).to_string();
-    game.register(pb::RegisterServerRequest {
-        api: Some(pb::ApiVersion {
-            major: 1,
-            minor: 0,
-            capabilities: vec![],
-        }),
-        auth_token: "load-server".into(),
-        server_id: server_id.clone(),
-        generation: 1,
-        endpoint: "127.0.0.1:7200".into(),
-        region: "tw".into(),
-        capacity_total: 100,
-        max_instances: 100,
-        mode_costs: vec![
-            pb::ModeCost {
-                mode: pb::QueueMode::OneVOne as i32,
-                cost: 1,
-            },
-            pb::ModeCost {
-                mode: pb::QueueMode::FiveVFive as i32,
-                cost: 1,
-            },
-            pb::ModeCost {
-                mode: pb::QueueMode::FreeForAll as i32,
-                cost: 1,
-            },
-        ],
-        instances: vec![],
-        server_class: String::new(),
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-    let (tx, rx) = tokio::sync::mpsc::channel(16);
-    let mut controls = game
-        .control_stream(ReceiverStream::new(rx))
+    let mode_servers = [
+        (pb::QueueMode::OneVOne, 1u32, 8u32, 2u32),
+        (pb::QueueMode::FiveVFive, 5, 20, 4),
+        (pb::QueueMode::FreeForAll, 4, 12, 3),
+    ];
+    let fleet: Vec<_> = ["tw", "us", "eu"]
+        .into_iter()
+        .flat_map(|region| mode_servers.into_iter().map(move |server| (region, server)))
+        .collect();
+    let mut game_servers = Vec::new();
+    for (index, (region, (supported_mode, cost, capacity, max_instances))) in
+        fleet.into_iter().enumerate()
+    {
+        let server_id = ServerId::from_uuid(uuid::Uuid::from_u128(
+            config.seed as u128 + index as u128 + 1,
+        ))
+        .to_string();
+        game.register(pb::RegisterServerRequest {
+            api: Some(pb::ApiVersion {
+                major: 1,
+                minor: 0,
+                capabilities: vec![],
+            }),
+            auth_token: "load-server".into(),
+            server_id: server_id.clone(),
+            generation: 1,
+            endpoint: format!("127.0.0.1:{}", 7200 + index),
+            region: region.into(),
+            capacity_total: capacity,
+            max_instances,
+            mode_costs: vec![pb::ModeCost {
+                mode: supported_mode as i32,
+                cost,
+            }],
+            instances: vec![],
+            server_class: String::new(),
+        })
         .await
-        .map_err(|e| e.to_string())?
-        .into_inner();
-    tx.send(pb::ServerControl {
-        api: Some(pb::ApiVersion {
-            major: 1,
-            minor: 0,
-            capabilities: vec![],
-        }),
-        server_id: server_id.clone(),
-        generation: 1,
-        auth_token: "load-server".into(),
-        message: Some(pb::server_control::Message::Heartbeat(pb::Heartbeat {
-            capacity_used: 0,
-            running_instances: 0,
-        })),
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-    let heartbeat_tx = tx.clone();
-    let heartbeat_server = server_id.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        loop {
-            interval.tick().await;
-            if heartbeat_tx
-                .send(pb::ServerControl {
-                    api: Some(pb::ApiVersion {
-                        major: 1,
-                        minor: 0,
-                        capabilities: vec![],
-                    }),
-                    server_id: heartbeat_server.clone(),
-                    generation: 1,
-                    auth_token: "load-server".into(),
-                    message: Some(pb::server_control::Message::Heartbeat(pb::Heartbeat {
-                        capacity_used: 0,
-                        running_instances: 0,
-                    })),
-                })
-                .await
-                .is_err()
-            {
-                break;
+        .map_err(|e| e.to_string())?;
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let controls = game
+            .control_stream(ReceiverStream::new(rx))
+            .await
+            .map_err(|e| e.to_string())?
+            .into_inner();
+        let heartbeat_tx = tx.clone();
+        let heartbeat_server = server_id.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                if heartbeat_tx
+                    .send(pb::ServerControl {
+                        api: Some(pb::ApiVersion {
+                            major: 1,
+                            minor: 0,
+                            capabilities: vec![],
+                        }),
+                        server_id: heartbeat_server.clone(),
+                        generation: 1,
+                        auth_token: "load-server".into(),
+                        message: Some(pb::server_control::Message::Heartbeat(pb::Heartbeat {
+                            capacity_used: 0,
+                            running_instances: 0,
+                        })),
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             }
-        }
-    });
+        });
+        game_servers.push((server_id, tx, controls));
+    }
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     async fn proposal(s: &mut erps_client::EventStream) -> Result<String, String> {
         loop {
@@ -777,6 +866,37 @@ pub async fn run_grpc(config: &ScenarioConfig) -> Result<TransportReport, String
                 Some(Ok(_)) => {}
                 Some(Err(e)) => return Err(e.to_string()),
                 None => return Err("event stream ended".into()),
+            }
+        }
+    }
+    async fn next_launch(
+        controls: &mut tonic::Streaming<pb::ErpsControl>,
+    ) -> Result<pb::LaunchMatch, String> {
+        loop {
+            let control = controls
+                .message()
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("control ended")?;
+            if let Some(pb::erps_control::Message::Launch(launch)) = control.message {
+                return Ok(launch);
+            }
+        }
+    }
+    async fn wait_match_result_ack(
+        controls: &mut tonic::Streaming<pb::ErpsControl>,
+        expected_match_id: &str,
+    ) -> Result<(), String> {
+        loop {
+            let control = controls
+                .message()
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("control ended before match result acknowledgement")?;
+            if let Some(pb::erps_control::Message::MatchResultAck(match_id)) = control.message {
+                if match_id == expected_match_id {
+                    return Ok(());
+                }
             }
         }
     }
@@ -810,12 +930,30 @@ pub async fn run_grpc(config: &ScenarioConfig) -> Result<TransportReport, String
     let mut completed_matches = 0usize;
     let mut completed_players = 0usize;
     let mut mode_matches = [0usize; 3];
+    let mut used_servers = BTreeSet::new();
+    let mut used_regions = BTreeSet::new();
     for (group_index, group) in groups.into_iter().enumerate() {
         let mut clients = Vec::new();
         let mut streams = Vec::new();
         let mut leaders = Vec::new();
+        let mut expected_parties = Vec::new();
         let mode = group[0].mode;
         let region = group[0].region.clone();
+        let mode_index = match mode {
+            QueueMode::OneVsOne => 0,
+            QueueMode::FiveVsFive => 1,
+            QueueMode::FreeForAll => 2,
+        };
+        let region_index = match region.as_str() {
+            "tw" => 0,
+            "us" => 1,
+            "eu" => 2,
+            _ => return Err(format!("unsupported generated region {region}")),
+        };
+        let server_index = region_index * 3 + mode_index;
+        let (server_id, tx, controls) = &mut game_servers[server_index];
+        used_servers.insert(server_id.clone());
+        used_regions.insert(region.clone());
         for (party_index, party) in group.into_iter().enumerate() {
             let first_token = format!("grpc-{group_index}-{party_index}-0");
             let mut leader =
@@ -856,6 +994,12 @@ pub async fn run_grpc(config: &ScenarioConfig) -> Result<TransportReport, String
             }
             let leader_slot = clients.len();
             leaders.push((leader_slot, party_id, revision));
+            expected_parties.push(
+                party_clients
+                    .iter()
+                    .map(|client| client.player_id().unwrap_or_default().to_owned())
+                    .collect(),
+            );
             clients.extend(party_clients);
         }
         for client in &mut clients {
@@ -871,7 +1015,7 @@ pub async fn run_grpc(config: &ScenarioConfig) -> Result<TransportReport, String
                         QueueMode::FiveVsFive => ClientMode::FiveVsFive,
                         QueueMode::FreeForAll => ClientMode::FreeForAll,
                     },
-                    [region.clone(), "tw".into()],
+                    [region.clone()],
                 )
                 .await
                 .map_err(|e| e.to_string())?;
@@ -893,15 +1037,32 @@ pub async fn run_grpc(config: &ScenarioConfig) -> Result<TransportReport, String
                 .await
                 .map_err(|e| e.to_string())?;
         }
-        let launch = tokio::time::timeout(std::time::Duration::from_secs(3), controls.message())
+        let launch = tokio::time::timeout(std::time::Duration::from_secs(3), next_launch(controls))
             .await
-            .map_err(|_| "launch timeout".to_owned())?
-            .map_err(|e| e.to_string())?
-            .ok_or("control ended")?;
-        let Some(pb::erps_control::Message::Launch(launch)) = launch.message else {
-            return Err("missing launch".into());
-        };
-        let match_id = launch.match_id;
+            .map_err(|_| "launch timeout".to_owned())??;
+        validate_grpc_launch(mode, &launch, &expected_parties)?;
+        let match_id = launch.match_id.clone();
+        tx.send(pb::ServerControl {
+            api: Some(pb::ApiVersion {
+                major: 1,
+                minor: 0,
+                capabilities: vec![],
+            }),
+            server_id: server_id.clone(),
+            generation: 1,
+            auth_token: "load-server".into(),
+            message: Some(pb::server_control::Message::LaunchResult(
+                pb::LaunchResult {
+                    match_id: match_id.clone(),
+                    state: "accepted".into(),
+                    endpoint: String::new(),
+                    connection_token: String::new(),
+                    reason: String::new(),
+                },
+            )),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
         tx.send(pb::ServerControl {
             api: Some(pb::ApiVersion {
                 major: 1,
@@ -928,14 +1089,21 @@ pub async fn run_grpc(config: &ScenarioConfig) -> Result<TransportReport, String
                 .await
                 .map_err(|_| "match event timeout".to_owned())??;
         }
-        let placements = clients
+        let placements = launch
+            .teams
             .iter()
             .enumerate()
-            .map(|(index, client)| pb::PlayerPlacement {
-                player_id: client.player_id().unwrap_or_default().to_owned(),
-                rank: (index + 1) as u32,
+            .flat_map(|(team_index, team)| {
+                team.player_ids
+                    .iter()
+                    .cloned()
+                    .map(move |player_id| pb::PlayerPlacement {
+                        player_id,
+                        rank: (team_index + 1) as u32,
+                    })
             })
             .collect();
+        let completed_match_id = match_id.clone();
         tx.send(pb::ServerControl {
             api: Some(pb::ApiVersion {
                 major: 1,
@@ -952,6 +1120,12 @@ pub async fn run_grpc(config: &ScenarioConfig) -> Result<TransportReport, String
         })
         .await
         .map_err(|e| e.to_string())?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            wait_match_result_ack(controls, &completed_match_id),
+        )
+        .await
+        .map_err(|_| "match result acknowledgement timeout".to_owned())??;
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
                 let state = clients[0].get_state().await.map_err(|e| e.to_string())?;
@@ -982,12 +1156,22 @@ pub async fn run_grpc(config: &ScenarioConfig) -> Result<TransportReport, String
         elapsed_ms: started.elapsed().as_millis(),
         rust_sdk: true,
         game_server_stream: true,
+        fleet_servers: game_servers.len(),
+        servers_used: used_servers.len(),
+        regions_used: used_regions.len(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn memory_high_watermark_comes_from_the_operating_system() {
+        let mut sampler = ProcessMemorySampler::new().unwrap();
+        sampler.sample().unwrap();
+        assert!(sampler.peak_bytes > 0);
+    }
+
     #[test]
     fn deterministic_1000_player_smoke() {
         let a = run(ScenarioConfig {
@@ -1006,6 +1190,18 @@ mod tests {
         assert_eq!(a.matches, b.matches);
         assert_eq!(a.logical_digest, b.logical_digest);
         assert_eq!(a.invariant_failures, 0)
+    }
+    #[test]
+    fn zero_workers_is_rejected_instead_of_misreported() {
+        assert_eq!(
+            run(ScenarioConfig {
+                players: 20,
+                seed: 1,
+                workers: 0,
+            })
+            .unwrap_err(),
+            "workers must be greater than zero"
+        );
     }
     #[test]
     fn generated_party_limits_hold() {
@@ -1047,5 +1243,60 @@ mod tests {
         let diagnostics = registry_diagnostics(&registry);
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].contains("exceeded capacity"));
+    }
+
+    #[test]
+    fn grpc_launch_checker_rejects_split_party_and_foreign_roster() {
+        let parties = vec![
+            vec!["a".into(), "b".into()],
+            vec!["c".into(), "d".into(), "e".into()],
+            vec!["f".into(), "g".into(), "h".into(), "i".into(), "j".into()],
+        ];
+        let split = pb::LaunchMatch {
+            mode: pb::QueueMode::FiveVFive as i32,
+            teams: vec![
+                pb::Team {
+                    team_index: 0,
+                    player_ids: ["a", "c", "d", "e", "f"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                },
+                pb::Team {
+                    team_index: 1,
+                    player_ids: ["b", "g", "h", "i", "j"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_grpc_launch(QueueMode::FiveVsFive, &split, &parties).unwrap_err(),
+            "gRPC launch split a 5v5 party across teams"
+        );
+        let mut foreign = split;
+        foreign.teams[1].player_ids[4] = "outsider".into();
+        assert_eq!(
+            validate_grpc_launch(QueueMode::FiveVsFive, &foreign, &parties).unwrap_err(),
+            "gRPC launch roster contains missing, duplicate, or foreign players"
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_transport_uses_heterogeneous_servers_in_every_region() {
+        let report = run_grpc(&ScenarioConfig {
+            players: 120,
+            seed: 1_163_022_419,
+            workers: 8,
+        })
+        .await
+        .unwrap();
+        assert_eq!(report.fleet_servers, 9);
+        assert_eq!(report.regions_used, 3);
+        assert!(report.servers_used >= 6);
+        assert!(report.mode_matches.into_iter().all(|matches| matches > 0));
+        assert_eq!(report.completed_match_results, report.completed_matches);
     }
 }

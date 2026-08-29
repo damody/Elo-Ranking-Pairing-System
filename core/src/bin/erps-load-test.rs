@@ -7,6 +7,12 @@ async fn main() -> anyhow::Result<()> {
     let mut output = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "-h" | "--help" => {
+                println!(
+                    "ERPS deterministic load validator\n\nUsage: erps-load-test [OPTIONS]\n\nOptions:\n  --players <COUNT>       Player count (minimum 20; default 100000)\n  --seed <SEED>           Deterministic seed\n  --workers <COUNT>       Rayon worker count (minimum 1)\n  --grpc                  Exercise the full loopback gRPC path\n  --baseline <PATH>       Compare against a JSON report\n  --output <PATH>         Save the JSON report\n  -h, --help              Print this help"
+                );
+                return Ok(());
+            }
             "--players" => {
                 config.players = args
                     .next()
