@@ -35,6 +35,7 @@ pub struct ErpsClient {
 }
 pub struct ErpsEvent {
     kind: u32,
+    deadline_ms: i64,
     entity_id: CString,
     revision: u64,
     endpoint: CString,
@@ -43,7 +44,28 @@ pub struct ErpsEvent {
     ticket_id: CString,
     proposal_id: CString,
     match_id: CString,
+    party_name: CString,
+    party_leader_id: CString,
+    party_state: CString,
+    party_members: Vec<ErpsPlayer>,
+    reason: CString,
+    player_rating_one_v_one: i32,
+    player_rating_five_v_five: i32,
+    player_rating_free_for_all: i32,
+    player_credit: u32,
+    player_eligible: bool,
+    credit_suspended_until_ms: i64,
+    queue_mode: u32,
+    allowed_regions: Vec<CString>,
     teams: Vec<Vec<CString>>,
+}
+pub struct ErpsPlayer {
+    id: CString,
+    rating: i32,
+    rating_one_v_one: i32,
+    rating_five_v_five: i32,
+    rating_free_for_all: i32,
+    credit: u32,
 }
 
 fn ffi(f: impl FnOnce() -> i32) -> i32 {
@@ -61,11 +83,19 @@ unsafe fn text<'a>(p: *const c_char) -> Option<&'a str> {
 fn cstring(v: impl Into<String>) -> CString {
     CString::new(v.into()).unwrap_or_else(|_| CString::new("invalid-string").unwrap())
 }
+fn ffi_mode(mode: QueueMode) -> u32 {
+    match mode {
+        QueueMode::OneVsOne => 1,
+        QueueMode::FiveVsFive => 2,
+        QueueMode::FreeForAll => 3,
+    }
+}
 fn mapped_event(event: Event) -> ErpsEvent {
     let empty = || cstring("");
     match event {
         Event::Party(v) => ErpsEvent {
             kind: 1,
+            deadline_ms: 0,
             entity_id: cstring(&v.id),
             revision: v.revision,
             endpoint: cstring(""),
@@ -74,10 +104,38 @@ fn mapped_event(event: Event) -> ErpsEvent {
             ticket_id: empty(),
             proposal_id: empty(),
             match_id: empty(),
+            party_name: cstring(v.name),
+            party_leader_id: cstring(v.leader_id),
+            party_state: cstring(v.state),
+            party_members: v
+                .player_details
+                .into_iter()
+                .map(|player| ErpsPlayer {
+                    id: cstring(player.id),
+                    rating: player.rating,
+                    rating_one_v_one: player.rating_one_v_one,
+                    rating_five_v_five: player.rating_five_v_five,
+                    rating_free_for_all: player.rating_free_for_all,
+                    credit: player.credit,
+                })
+                .collect(),
+            reason: empty(),
+            player_rating_one_v_one: 0,
+            player_rating_five_v_five: 0,
+            player_rating_free_for_all: 0,
+            player_credit: 0,
+            player_eligible: true,
+            credit_suspended_until_ms: 0,
+            queue_mode: 0,
+            allowed_regions: Vec::new(),
             teams: Vec::new(),
         },
-        Event::Proposal { proposal_id, .. } => ErpsEvent {
+        Event::Proposal {
+            proposal_id,
+            deadline_ms,
+        } => ErpsEvent {
             kind: 2,
+            deadline_ms,
             entity_id: cstring(&proposal_id),
             revision: 0,
             endpoint: cstring(""),
@@ -86,15 +144,30 @@ fn mapped_event(event: Event) -> ErpsEvent {
             ticket_id: empty(),
             proposal_id: cstring(&proposal_id),
             match_id: empty(),
+            party_name: empty(),
+            party_leader_id: empty(),
+            party_state: empty(),
+            party_members: Vec::new(),
+            reason: empty(),
+            player_rating_one_v_one: 0,
+            player_rating_five_v_five: 0,
+            player_rating_free_for_all: 0,
+            player_credit: 0,
+            player_eligible: true,
+            credit_suspended_until_ms: 0,
+            queue_mode: 0,
+            allowed_regions: Vec::new(),
             teams: Vec::new(),
         },
         Event::Matched {
             match_id,
+            mode,
             teams,
             endpoint,
             connection_token,
         } => ErpsEvent {
             kind: 3,
+            deadline_ms: 0,
             entity_id: cstring(&match_id),
             revision: 0,
             endpoint: cstring(endpoint),
@@ -103,6 +176,19 @@ fn mapped_event(event: Event) -> ErpsEvent {
             ticket_id: empty(),
             proposal_id: empty(),
             match_id: cstring(&match_id),
+            party_name: empty(),
+            party_leader_id: empty(),
+            party_state: empty(),
+            party_members: Vec::new(),
+            reason: empty(),
+            player_rating_one_v_one: 0,
+            player_rating_five_v_five: 0,
+            player_rating_free_for_all: 0,
+            player_credit: 0,
+            player_eligible: true,
+            credit_suspended_until_ms: 0,
+            queue_mode: ffi_mode(mode),
+            allowed_regions: Vec::new(),
             teams: teams
                 .into_iter()
                 .map(|team| team.into_iter().map(cstring).collect())
@@ -110,6 +196,7 @@ fn mapped_event(event: Event) -> ErpsEvent {
         },
         Event::ServerLost { match_id } => ErpsEvent {
             kind: 4,
+            deadline_ms: 0,
             entity_id: cstring(&match_id),
             revision: 0,
             endpoint: cstring(""),
@@ -118,18 +205,100 @@ fn mapped_event(event: Event) -> ErpsEvent {
             ticket_id: empty(),
             proposal_id: empty(),
             match_id: cstring(&match_id),
+            party_name: empty(),
+            party_leader_id: empty(),
+            party_state: empty(),
+            party_members: Vec::new(),
+            reason: empty(),
+            player_rating_one_v_one: 0,
+            player_rating_five_v_five: 0,
+            player_rating_free_for_all: 0,
+            player_credit: 0,
+            player_eligible: true,
+            credit_suspended_until_ms: 0,
+            queue_mode: 0,
+            allowed_regions: Vec::new(),
             teams: Vec::new(),
         },
-        Event::State(v) => ErpsEvent {
-            kind: 5,
-            entity_id: cstring(v.player_id),
+        Event::State(v) => {
+            let profile = v.profile.as_ref();
+            ErpsEvent {
+                kind: 5,
+                deadline_ms: v.proposal_deadline_ms.unwrap_or(0),
+                entity_id: cstring(v.player_id),
+                revision: 0,
+                endpoint: cstring(""),
+                connection_token: cstring(""),
+                party_id: cstring(v.party.as_ref().map_or("", |party| party.id.as_str())),
+                ticket_id: cstring(v.ticket_id.unwrap_or_default()),
+                proposal_id: cstring(v.proposal_id.unwrap_or_default()),
+                match_id: cstring(v.match_id.unwrap_or_default()),
+                party_name: cstring(v.party.as_ref().map_or("", |party| party.name.as_str())),
+                party_leader_id: cstring(
+                    v.party
+                        .as_ref()
+                        .map_or("", |party| party.leader_id.as_str()),
+                ),
+                party_state: cstring(v.party.as_ref().map_or("", |party| party.state.as_str())),
+                party_members: v
+                    .party
+                    .map(|party| {
+                        party
+                            .player_details
+                            .into_iter()
+                            .map(|player| ErpsPlayer {
+                                id: cstring(player.id),
+                                rating: player.rating,
+                                rating_one_v_one: player.rating_one_v_one,
+                                rating_five_v_five: player.rating_five_v_five,
+                                rating_free_for_all: player.rating_free_for_all,
+                                credit: player.credit,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                reason: empty(),
+                player_rating_one_v_one: profile.map_or(0, |player| player.rating_one_v_one),
+                player_rating_five_v_five: profile.map_or(0, |player| player.rating_five_v_five),
+                player_rating_free_for_all: profile.map_or(0, |player| player.rating_free_for_all),
+                player_credit: profile.map_or(0, |player| player.credit),
+                player_eligible: v.credit_suspended_until_ms.is_none(),
+                credit_suspended_until_ms: v.credit_suspended_until_ms.unwrap_or(0),
+                queue_mode: v.queue_mode.map_or(0, ffi_mode),
+                allowed_regions: v.allowed_regions.into_iter().map(cstring).collect(),
+                teams: Vec::new(),
+            }
+        }
+        Event::ProposalCancelled {
+            proposal_id,
+            reason,
+            credit,
+            eligible,
+            credit_suspended_until_ms,
+        } => ErpsEvent {
+            kind: 6,
+            deadline_ms: 0,
+            entity_id: cstring(&proposal_id),
             revision: 0,
-            endpoint: cstring(""),
-            connection_token: cstring(""),
-            party_id: cstring(v.party.as_ref().map_or("", |party| party.id.as_str())),
-            ticket_id: cstring(v.ticket_id.unwrap_or_default()),
-            proposal_id: cstring(v.proposal_id.unwrap_or_default()),
-            match_id: cstring(v.match_id.unwrap_or_default()),
+            endpoint: empty(),
+            connection_token: empty(),
+            party_id: empty(),
+            ticket_id: empty(),
+            proposal_id: cstring(proposal_id),
+            match_id: empty(),
+            party_name: empty(),
+            party_leader_id: empty(),
+            party_state: empty(),
+            party_members: Vec::new(),
+            reason: cstring(reason),
+            player_rating_one_v_one: 0,
+            player_rating_five_v_five: 0,
+            player_rating_free_for_all: 0,
+            player_credit: credit,
+            player_eligible: eligible,
+            credit_suspended_until_ms: credit_suspended_until_ms.unwrap_or(0),
+            queue_mode: 0,
+            allowed_regions: Vec::new(),
             teams: Vec::new(),
         },
     }
@@ -145,7 +314,7 @@ pub unsafe extern "C" fn erps_client_create(
     auth_token: *const c_char,
     out: *mut *mut ErpsClient,
 ) -> i32 {
-    create_client(endpoint, auth_token, ptr::null(), out)
+    create_client(endpoint, auth_token, ptr::null(), ptr::null(), out)
 }
 #[no_mangle]
 pub unsafe extern "C" fn erps_client_create_tls(
@@ -154,21 +323,42 @@ pub unsafe extern "C" fn erps_client_create_tls(
     tls_domain: *const c_char,
     out: *mut *mut ErpsClient,
 ) -> i32 {
+    if !out.is_null() {
+        *out = ptr::null_mut();
+    }
     if tls_domain.is_null() {
         return ERPS_INVALID_ARGUMENT;
     }
-    create_client(endpoint, auth_token, tls_domain, out)
+    create_client(endpoint, auth_token, tls_domain, ptr::null(), out)
+}
+#[no_mangle]
+pub unsafe extern "C" fn erps_client_create_tls_with_ca(
+    endpoint: *const c_char,
+    auth_token: *const c_char,
+    tls_domain: *const c_char,
+    ca_pem: *const c_char,
+    out: *mut *mut ErpsClient,
+) -> i32 {
+    if !out.is_null() {
+        *out = ptr::null_mut();
+    }
+    if tls_domain.is_null() || ca_pem.is_null() {
+        return ERPS_INVALID_ARGUMENT;
+    }
+    create_client(endpoint, auth_token, tls_domain, ca_pem, out)
 }
 unsafe fn create_client(
     endpoint: *const c_char,
     auth_token: *const c_char,
     tls_domain: *const c_char,
+    ca_pem: *const c_char,
     out: *mut *mut ErpsClient,
 ) -> i32 {
     ffi(|| {
         if out.is_null() {
             return ERPS_INVALID_ARGUMENT;
         }
+        *out = ptr::null_mut();
         let Some(endpoint) = text(endpoint) else {
             return ERPS_INVALID_ARGUMENT;
         };
@@ -182,9 +372,12 @@ unsafe fn create_client(
             Ok(v) => v,
             Err(_) => return ERPS_RUNTIME_ERROR,
         };
-        let options = match text(tls_domain) {
-            Some(domain) => ConnectOptions::tls(endpoint, auth, domain),
-            None => ConnectOptions::plaintext_loopback(endpoint, auth),
+        let options = match (text(tls_domain), text(ca_pem)) {
+            (Some(domain), Some(ca)) => {
+                ConnectOptions::tls_with_ca(endpoint, auth, domain, ca.as_bytes())
+            }
+            (Some(domain), None) => ConnectOptions::tls(endpoint, auth, domain),
+            (None, _) => ConnectOptions::plaintext_loopback(endpoint, auth),
         };
         let client = match runtime.block_on(Client::connect(options)) {
             Ok(v) => v,
@@ -250,10 +443,9 @@ pub unsafe extern "C" fn erps_client_start_events(client: *mut ErpsClient) -> i3
                         }
                         Some(Err(error)) => {
                             *last_error.lock() = cstring(format!(
-                                "event stream stopped: {error}; call GetState"
+                                "event stream reconnecting after transient error: {error}"
                             ));
-                            failed.store(true, Ordering::Release);
-                            break;
+                            continue;
                         }
                         None => {
                             *last_error.lock() =
@@ -326,6 +518,7 @@ pub unsafe extern "C" fn erps_client_create_invite(
         if out_token.is_null() || out_token_size == 0 {
             return ERPS_INVALID_ARGUMENT;
         }
+        *out_token = 0;
         let result = c.runtime.block_on(c.client.lock().create_invite(
             party_id,
             revision,
@@ -533,12 +726,13 @@ pub unsafe extern "C" fn erps_client_poll(
     out: *mut *mut ErpsEvent,
 ) -> i32 {
     ffi(|| {
-        let Some(c) = client.as_ref() else {
-            return ERPS_INVALID_ARGUMENT;
-        };
         if out.is_null() {
             return ERPS_INVALID_ARGUMENT;
         }
+        *out = ptr::null_mut();
+        let Some(c) = client.as_ref() else {
+            return ERPS_INVALID_ARGUMENT;
+        };
         let current = std::thread::current().id();
         let mut owner = c.poll_thread.lock();
         match *owner {
@@ -563,6 +757,10 @@ pub unsafe extern "C" fn erps_client_poll(
 #[no_mangle]
 pub unsafe extern "C" fn erps_event_kind(event: *const ErpsEvent) -> u32 {
     ffi_value(0, || event.as_ref().map_or(0, |v| v.kind))
+}
+#[no_mangle]
+pub unsafe extern "C" fn erps_event_deadline_ms(event: *const ErpsEvent) -> i64 {
+    ffi_value(0, || event.as_ref().map_or(0, |v| v.deadline_ms))
 }
 #[no_mangle]
 pub unsafe extern "C" fn erps_event_entity_id(event: *const ErpsEvent) -> *const c_char {
@@ -612,6 +810,144 @@ pub unsafe extern "C" fn erps_event_proposal_id(event: *const ErpsEvent) -> *con
 pub unsafe extern "C" fn erps_event_match_id(event: *const ErpsEvent) -> *const c_char {
     ffi_value(ptr::null(), || {
         event.as_ref().map_or(ptr::null(), |v| v.match_id.as_ptr())
+    })
+}
+#[no_mangle]
+pub unsafe extern "C" fn erps_event_party_name(event: *const ErpsEvent) -> *const c_char {
+    ffi_value(ptr::null(), || {
+        event
+            .as_ref()
+            .map_or(ptr::null(), |v| v.party_name.as_ptr())
+    })
+}
+#[no_mangle]
+pub unsafe extern "C" fn erps_event_party_leader_id(event: *const ErpsEvent) -> *const c_char {
+    ffi_value(ptr::null(), || {
+        event
+            .as_ref()
+            .map_or(ptr::null(), |v| v.party_leader_id.as_ptr())
+    })
+}
+#[no_mangle]
+pub unsafe extern "C" fn erps_event_party_state(event: *const ErpsEvent) -> *const c_char {
+    ffi_value(ptr::null(), || {
+        event
+            .as_ref()
+            .map_or(ptr::null(), |v| v.party_state.as_ptr())
+    })
+}
+#[no_mangle]
+pub unsafe extern "C" fn erps_event_party_member_count(event: *const ErpsEvent) -> usize {
+    ffi_value(0, || event.as_ref().map_or(0, |v| v.party_members.len()))
+}
+#[no_mangle]
+pub unsafe extern "C" fn erps_event_party_member_id(
+    event: *const ErpsEvent,
+    member_index: usize,
+) -> *const c_char {
+    ffi_value(ptr::null(), || {
+        event
+            .as_ref()
+            .and_then(|v| v.party_members.get(member_index))
+            .map_or(ptr::null(), |player| player.id.as_ptr())
+    })
+}
+#[no_mangle]
+pub unsafe extern "C" fn erps_event_party_member_rating(
+    event: *const ErpsEvent,
+    member_index: usize,
+) -> i32 {
+    ffi_value(0, || {
+        event
+            .as_ref()
+            .and_then(|v| v.party_members.get(member_index))
+            .map_or(0, |player| player.rating)
+    })
+}
+#[no_mangle]
+pub unsafe extern "C" fn erps_event_party_member_rating_for_mode(
+    event: *const ErpsEvent,
+    member_index: usize,
+    mode: u32,
+) -> i32 {
+    ffi_value(0, || {
+        event
+            .as_ref()
+            .and_then(|v| v.party_members.get(member_index))
+            .map_or(0, |player| match mode {
+                1 => player.rating_one_v_one,
+                2 => player.rating_five_v_five,
+                3 => player.rating_free_for_all,
+                _ => 0,
+            })
+    })
+}
+#[no_mangle]
+pub unsafe extern "C" fn erps_event_party_member_credit(
+    event: *const ErpsEvent,
+    member_index: usize,
+) -> u32 {
+    ffi_value(0, || {
+        event
+            .as_ref()
+            .and_then(|v| v.party_members.get(member_index))
+            .map_or(0, |player| player.credit)
+    })
+}
+#[no_mangle]
+pub unsafe extern "C" fn erps_event_reason(event: *const ErpsEvent) -> *const c_char {
+    ffi_value(ptr::null(), || {
+        event.as_ref().map_or(ptr::null(), |v| v.reason.as_ptr())
+    })
+}
+#[no_mangle]
+pub unsafe extern "C" fn erps_event_player_rating_for_mode(
+    event: *const ErpsEvent,
+    mode: u32,
+) -> i32 {
+    ffi_value(0, || {
+        event.as_ref().map_or(0, |value| match mode {
+            1 => value.player_rating_one_v_one,
+            2 => value.player_rating_five_v_five,
+            3 => value.player_rating_free_for_all,
+            _ => 0,
+        })
+    })
+}
+#[no_mangle]
+pub unsafe extern "C" fn erps_event_player_credit(event: *const ErpsEvent) -> u32 {
+    ffi_value(0, || event.as_ref().map_or(0, |v| v.player_credit))
+}
+#[no_mangle]
+pub unsafe extern "C" fn erps_event_player_eligible(event: *const ErpsEvent) -> u32 {
+    ffi_value(0, || {
+        event.as_ref().map_or(0, |v| u32::from(v.player_eligible))
+    })
+}
+#[no_mangle]
+pub unsafe extern "C" fn erps_event_credit_suspended_until_ms(event: *const ErpsEvent) -> i64 {
+    ffi_value(0, || {
+        event.as_ref().map_or(0, |v| v.credit_suspended_until_ms)
+    })
+}
+#[no_mangle]
+pub unsafe extern "C" fn erps_event_queue_mode(event: *const ErpsEvent) -> u32 {
+    ffi_value(0, || event.as_ref().map_or(0, |v| v.queue_mode))
+}
+#[no_mangle]
+pub unsafe extern "C" fn erps_event_allowed_region_count(event: *const ErpsEvent) -> usize {
+    ffi_value(0, || event.as_ref().map_or(0, |v| v.allowed_regions.len()))
+}
+#[no_mangle]
+pub unsafe extern "C" fn erps_event_allowed_region(
+    event: *const ErpsEvent,
+    region_index: usize,
+) -> *const c_char {
+    ffi_value(ptr::null(), || {
+        event
+            .as_ref()
+            .and_then(|v| v.allowed_regions.get(region_index))
+            .map_or(ptr::null(), |region| region.as_ptr())
     })
 }
 #[no_mangle]
@@ -675,7 +1011,40 @@ mod tests {
         assert_eq!(event.entity_id.to_str().unwrap(), "m1")
     }
     #[test]
+    fn cancellation_maps_reason_credit_and_suspension_for_c_consumers() {
+        let event = mapped_event(Event::ProposalCancelled {
+            proposal_id: "p1".into(),
+            reason: "timed_out".into(),
+            credit: 55,
+            eligible: false,
+            credit_suspended_until_ms: Some(12345),
+        });
+        assert_eq!(event.kind, 6);
+        assert_eq!(event.reason.to_str().unwrap(), "timed_out");
+        assert_eq!(event.player_credit, 55);
+        assert!(!event.player_eligible);
+        assert_eq!(event.credit_suspended_until_ms, 12345);
+    }
+    #[test]
     fn exported_value_guard_contains_panics() {
         assert_eq!(ffi_value(17_u32, || panic!("ffi test panic")), 17);
+    }
+    #[test]
+    fn failed_output_calls_clear_caller_pointers() {
+        unsafe {
+            let mut event = std::ptr::NonNull::<ErpsEvent>::dangling().as_ptr();
+            assert_eq!(
+                erps_client_poll(ptr::null_mut(), &mut event),
+                ERPS_INVALID_ARGUMENT
+            );
+            assert!(event.is_null());
+
+            let mut client = std::ptr::NonNull::<ErpsClient>::dangling().as_ptr();
+            assert_eq!(
+                erps_client_create_tls(ptr::null(), ptr::null(), ptr::null(), &mut client),
+                ERPS_INVALID_ARGUMENT
+            );
+            assert!(client.is_null());
+        }
     }
 }
