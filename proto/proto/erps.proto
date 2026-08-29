@@ -21,12 +21,13 @@ message ProposalResponseRequest { MutationMeta meta = 1; string proposal_id = 2;
 message StateRequest { string session_token = 1; ApiVersion api = 2; }
 message WatchEventsRequest { string session_token = 1; ApiVersion api = 2; }
 message OperationResult { bool accepted = 1; string code = 2; string message = 3; string entity_id = 4; uint64 revision = 5; }
-message PlayerView { string player_id = 1; int32 rating = 2; uint32 credit = 3; }
+message PlayerView { string player_id = 1; int32 rating = 2; uint32 credit = 3; int32 rating_one_v_one = 4; int32 rating_five_v_five = 5; int32 rating_free_for_all = 6; }
 message PartyView { string party_id = 1; string name = 2; string leader_id = 3; repeated PlayerView members = 4; uint64 revision = 5; string state = 6; }
-message ClientState { string player_id = 1; PartyView party = 2; string ticket_id = 3; string proposal_id = 4; string match_id = 5; }
+message ClientState { string player_id = 1; PartyView party = 2; string ticket_id = 3; string proposal_id = 4; string match_id = 5; PlayerView profile = 6; int64 credit_suspended_until_ms = 7; QueueMode queue_mode = 8; repeated string allowed_regions = 9; int64 proposal_deadline_ms = 10; }
 message MatchEvent { string match_id = 1; QueueMode mode = 2; repeated Team teams = 3; string endpoint = 4; string connection_token = 5; }
 message Team { uint32 team_index = 1; repeated string player_ids = 2; }
-message ClientEvent { oneof event { PartyView party = 1; string proposal_id = 2; MatchEvent matched = 3; string server_lost_match_id = 4; ClientState state = 5; } int64 deadline_ms = 10; }
+message ProposalCancelledEvent { string proposal_id = 1; string reason = 2; uint32 credit = 3; bool eligible = 4; int64 credit_suspended_until_ms = 5; }
+message ClientEvent { oneof event { PartyView party = 1; string proposal_id = 2; MatchEvent matched = 3; string server_lost_match_id = 4; ClientState state = 5; ProposalCancelledEvent proposal_cancelled = 6; } int64 deadline_ms = 10; }
 
 message RegisterServerRequest { ApiVersion api = 1; string auth_token = 2; string server_id = 3; uint64 generation = 4; string endpoint = 5; string region = 6; uint32 capacity_total = 7; uint32 max_instances = 8; repeated ModeCost mode_costs = 9; repeated InstanceState instances = 10; string server_class = 11; }
 message ModeCost { QueueMode mode = 1; uint32 cost = 2; }

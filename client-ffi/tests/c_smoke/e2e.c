@@ -1,3 +1,6 @@
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "erps_client.h"
 #include <assert.h>
 #include <stdio.h>
@@ -24,8 +27,12 @@ static DWORD WINAPI cancel_thread(void *p) {
 }
 #else
 #include <pthread.h>
-#include <unistd.h>
-#define PAUSE() usleep(10000)
+#include <time.h>
+static void pause_for_events(void) {
+  const struct timespec duration = {0, 10 * 1000 * 1000};
+  nanosleep(&duration, 0);
+}
+#define PAUSE() pause_for_events()
 typedef pthread_t test_thread;
 static void *poll_other_thread(void *p) {
   ErpsEvent *e = 0;
@@ -68,8 +75,20 @@ int main(int argc, char **argv) {
     PAUSE();
   assert(erps_client_create_party(a, "CParty1") == ERPS_OK);
   assert(erps_client_create_party(b, "CParty2") == ERPS_OK);
-  ErpsEvent *pa = wait_kind(a, 1), *pb = wait_kind(b, 1);
+  ErpsEvent *pa = wait_kind(a, ERPS_EVENT_PARTY),
+            *pb = wait_kind(b, ERPS_EVENT_PARTY);
   assert(pa && pb);
+  assert(strcmp(erps_event_party_name(pa), "CParty1") == 0);
+  assert(strlen(erps_event_party_leader_id(pa)) > 0);
+  assert(erps_event_party_member_count(pa) == 1);
+  assert(strlen(erps_event_party_member_id(pa, 0)) > 0);
+  assert(erps_event_party_member_rating(pa, 0) == 1000);
+  assert(erps_event_party_member_rating_for_mode(pa, 0, ERPS_MODE_1V1) == 1000);
+  assert(erps_event_party_member_rating_for_mode(pa, 0, ERPS_MODE_5V5) == 1000);
+  assert(erps_event_party_member_rating_for_mode(pa, 0, ERPS_MODE_FFA8) == 1000);
+  assert(erps_event_party_member_rating_for_mode(pa, 0, 999) == 0);
+  assert(erps_event_party_member_credit(pa, 0) == 100);
+  assert(erps_event_party_member_id(pa, 1) == 0);
   char aid[64], bid[64];
   strcpy(aid, erps_event_entity_id(pa));
   strcpy(bid, erps_event_entity_id(pb));
@@ -81,31 +100,32 @@ int main(int argc, char **argv) {
          ERPS_OK);
   assert(strlen(invite) > 0);
   assert(erps_client_join_party(c, invite) == ERPS_OK);
-  ErpsEvent *pc = wait_kind(c, 1), *aj = wait_kind(a, 1);
+  ErpsEvent *pc = wait_kind(c, ERPS_EVENT_PARTY),
+            *aj = wait_kind(a, ERPS_EVENT_PARTY);
   assert(pc && aj);
   uint64_t cr = erps_event_revision(pc);
   assert(strcmp(erps_event_party_id(pc), aid) == 0);
   erps_event_release(pc);
   erps_event_release(aj);
   assert(erps_client_leave_party(c, aid, cr) == ERPS_OK);
-  ErpsEvent *al = wait_kind(a, 1);
+  ErpsEvent *al = wait_kind(a, ERPS_EVENT_PARTY);
   assert(al);
   ar = erps_event_revision(al);
   erps_event_release(al);
   assert(erps_client_rename_party(a, aid, ar, "CPartyRenamed1") == ERPS_OK);
-  ErpsEvent *arenamed = wait_kind(a, 1);
+  ErpsEvent *arenamed = wait_kind(a, ERPS_EVENT_PARTY);
   assert(arenamed);
   ar = erps_event_revision(arenamed);
   erps_event_release(arenamed);
   assert(erps_client_create_party(c, "CancelParty3") == ERPS_OK);
-  ErpsEvent *cp = wait_kind(c, 1);
+  ErpsEvent *cp = wait_kind(c, ERPS_EVENT_PARTY);
   assert(cp);
   char cid[64];
   strcpy(cid, erps_event_entity_id(cp));
   cr = erps_event_revision(cp);
   erps_event_release(cp);
   assert(erps_client_enqueue(c, cid, cr, ERPS_MODE_1V1, "tw") == ERPS_OK);
-  ErpsEvent *cq = wait_kind(c, 1);
+  ErpsEvent *cq = wait_kind(c, ERPS_EVENT_PARTY);
   assert(cq);
   cr = erps_event_revision(cq);
   erps_event_release(cq);
@@ -157,20 +177,30 @@ int main(int argc, char **argv) {
   assert((intptr_t)ctr == ERPS_OK && (intptr_t)csr == ERPS_OK);
 #endif
   assert(erps_client_get_state(c) == ERPS_OK);
-  ErpsEvent *cstate1 = wait_kind(c, 5), *cstate2 = wait_kind(c, 5);
+  ErpsEvent *cstate1 = wait_kind(c, ERPS_EVENT_STATE),
+            *cstate2 = wait_kind(c, ERPS_EVENT_STATE);
   assert(cstate1 && cstate2);
   assert(strlen(erps_event_ticket_id(cstate2)) == 0);
   erps_event_release(cstate1);
   erps_event_release(cstate2);
-  ErpsEvent *state1 = wait_kind(a, 5), *state2 = wait_kind(a, 5);
+  ErpsEvent *state1 = wait_kind(a, ERPS_EVENT_STATE),
+            *state2 = wait_kind(a, ERPS_EVENT_STATE);
   assert(state1 && state2);
   assert(strcmp(erps_event_party_id(state1), aid) == 0);
+  assert(erps_event_player_rating_for_mode(state1, ERPS_MODE_1V1) == 1000);
+  assert(erps_event_player_rating_for_mode(state1, ERPS_MODE_5V5) == 1000);
+  assert(erps_event_player_rating_for_mode(state1, ERPS_MODE_FFA8) == 1000);
+  assert(erps_event_player_credit(state1) == 100);
+  assert(erps_event_player_eligible(state1) == 1);
+  assert(erps_event_credit_suspended_until_ms(state1) == 0);
   erps_event_release(state1);
   erps_event_release(state2);
   assert(erps_client_enqueue(a, aid, ar, ERPS_MODE_1V1, "tw") == ERPS_OK);
   assert(erps_client_enqueue(b, bid, br, ERPS_MODE_1V1, "tw") == ERPS_OK);
-  ErpsEvent *qa = wait_kind(a, 2), *qb = wait_kind(b, 2);
+  ErpsEvent *qa = wait_kind(a, ERPS_EVENT_PROPOSAL),
+            *qb = wait_kind(b, ERPS_EVENT_PROPOSAL);
   assert(qa && qb);
+  assert(erps_event_deadline_ms(qa) > 0);
   char proposal[64];
   strcpy(proposal, erps_event_entity_id(qa));
   assert(strcmp(proposal, erps_event_entity_id(qb)) == 0);
@@ -183,11 +213,13 @@ int main(int argc, char **argv) {
             erps_client_last_error(a), accept_b, erps_client_last_error(b));
     return 2;
   }
-  ErpsEvent *ma = wait_kind(a, 3), *mb = wait_kind(b, 3);
+  ErpsEvent *ma = wait_kind(a, ERPS_EVENT_MATCHED),
+            *mb = wait_kind(b, ERPS_EVENT_MATCHED);
   assert(ma && mb);
   assert(strlen(erps_event_endpoint(ma)) > 0);
   assert(strlen(erps_event_connection_token(ma)) > 0);
   assert(strcmp(erps_event_match_id(ma), erps_event_entity_id(ma)) == 0);
+  assert(erps_event_queue_mode(ma) == ERPS_MODE_1V1);
   assert(erps_event_team_count(ma) == 2);
   assert(erps_event_team_player_count(ma, 0) == 1);
   assert(erps_event_team_player_count(ma, 1) == 1);

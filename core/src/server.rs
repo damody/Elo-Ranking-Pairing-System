@@ -71,14 +71,23 @@ impl Registry {
 
     pub fn register(
         &mut self,
-        server: GameServer,
+        mut server: GameServer,
         limits: ServerLimits,
     ) -> Result<(), ServerError> {
-        if server.capacity_total == 0
+        if server.endpoint.trim().is_empty()
+            || server.region.trim().is_empty()
+            || server.modes.is_empty()
+            || server.mode_costs.is_empty()
+            || server.modes != server.mode_costs.keys().copied().collect()
+            || server.capacity_total == 0
             || server.capacity_total > limits.max_capacity
             || server.max_instances == 0
             || server.max_instances > limits.max_instances.min(100)
             || server.mode_costs.values().any(|v| *v == 0)
+            || server
+                .instances
+                .values()
+                .any(|instance| !valid_instance_payload(instance))
             || server.capacity_used > server.capacity_total
             || server.instances.len() > server.max_instances as usize
         {
@@ -102,6 +111,48 @@ impl Registry {
                 old.health = Health::Healthy;
                 return Ok(());
             }
+            let mut merged = old.instances.clone();
+            for (match_id, reported) in &server.instances {
+                let authoritative = merged
+                    .get_mut(match_id)
+                    .ok_or(ServerError::UnknownInstance)?;
+                if authoritative.cost != reported.cost
+                    || !valid_reconciled_state(authoritative.state, reported.state)
+                    || !valid_instance_payload(reported)
+                {
+                    return Err(ServerError::InvalidCapacity);
+                }
+                authoritative.state = reported.state;
+                authoritative.endpoint = reported.endpoint.clone();
+                authoritative.connection_token = reported.connection_token.clone();
+            }
+            let capacity_used = merged
+                .values()
+                .filter(|instance| {
+                    !matches!(
+                        instance.state,
+                        InstanceState::Finished | InstanceState::ServerLost
+                    )
+                })
+                .try_fold(0_u32, |used, instance| used.checked_add(instance.cost))
+                .ok_or(ServerError::InvalidCapacity)?;
+            let active_instances = merged
+                .values()
+                .filter(|instance| {
+                    !matches!(
+                        instance.state,
+                        InstanceState::Finished | InstanceState::ServerLost
+                    )
+                })
+                .count();
+            if capacity_used > server.capacity_total
+                || active_instances > server.max_instances as usize
+            {
+                return Err(ServerError::InvalidCapacity);
+            }
+            server.instances = merged;
+            server.capacity_used = capacity_used;
+            server.failures = old.failures;
         }
         self.servers.insert(server.id, server);
         Ok(())
@@ -195,6 +246,11 @@ impl Registry {
             if authoritative.cost != reported.cost {
                 return Err(ServerError::InvalidCapacity);
             }
+            if !valid_reconciled_state(authoritative.state, reported.state)
+                || !valid_instance_payload(&reported)
+            {
+                return Err(ServerError::InvalidCapacity);
+            }
             authoritative.state = reported.state;
             authoritative.endpoint = reported.endpoint;
             authoritative.connection_token = reported.connection_token;
@@ -212,6 +268,50 @@ impl Registry {
             .sum::<u32>()
             .min(server.capacity_total);
         Ok(())
+    }
+}
+
+fn valid_reconciled_state(authoritative: InstanceState, reported: InstanceState) -> bool {
+    if authoritative == reported {
+        return true;
+    }
+    // Completion is authoritative only after MatchResult has settled ratings, players, and
+    // capacity. Reconciliation may recover forward progress missed while disconnected, but it
+    // must never manufacture a terminal state or move a live instance backwards.
+    if matches!(
+        reported,
+        InstanceState::Finished | InstanceState::ServerLost
+    ) || authoritative == InstanceState::Finished
+    {
+        return false;
+    }
+    if authoritative == InstanceState::ServerLost {
+        return matches!(reported, InstanceState::Ready | InstanceState::Running);
+    }
+    instance_state_rank(reported) >= instance_state_rank(authoritative)
+}
+
+fn valid_instance_payload(instance: &Instance) -> bool {
+    !matches!(
+        instance.state,
+        InstanceState::Ready | InstanceState::Running
+    ) || instance
+        .endpoint
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && instance
+            .connection_token
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn instance_state_rank(state: InstanceState) -> u8 {
+    match state {
+        InstanceState::Reserved => 0,
+        InstanceState::Accepted => 1,
+        InstanceState::Ready => 2,
+        InstanceState::Running => 3,
+        InstanceState::Finished | InstanceState::ServerLost => 4,
     }
 }
 
@@ -316,9 +416,40 @@ mod tests {
                 },
             )
             .unwrap();
+        let mut missing_credentials = registry.servers[&id].instances.clone();
+        missing_credentials.get_mut(&match_id).unwrap().state = InstanceState::Running;
+        assert_eq!(
+            registry.reconcile(id, ServerGeneration(1), missing_credentials),
+            Err(ServerError::InvalidCapacity)
+        );
+        assert_eq!(
+            registry.servers[&id].instances[&match_id].state,
+            InstanceState::Accepted
+        );
+
         let mut report = registry.servers[&id].instances.clone();
-        report.get_mut(&match_id).unwrap().state = InstanceState::Running;
+        let reported = report.get_mut(&match_id).unwrap();
+        reported.state = InstanceState::Running;
+        reported.endpoint = Some("recovered-game".into());
+        reported.connection_token = Some("recovered-token".into());
         registry.reconcile(id, ServerGeneration(1), report).unwrap();
+        assert_eq!(
+            registry.servers[&id].instances[&match_id].state,
+            InstanceState::Running
+        );
+        assert_eq!(
+            registry.servers[&id].instances[&match_id]
+                .endpoint
+                .as_deref(),
+            Some("recovered-game")
+        );
+        let mut premature_finish = registry.servers[&id].instances.clone();
+        premature_finish.get_mut(&match_id).unwrap().state = InstanceState::Finished;
+        assert_eq!(
+            registry.reconcile(id, ServerGeneration(1), premature_finish),
+            Err(ServerError::InvalidCapacity)
+        );
+        assert_eq!(registry.servers[&id].capacity_used, 1);
         assert_eq!(
             registry.servers[&id].instances[&match_id].state,
             InstanceState::Running
@@ -376,5 +507,63 @@ mod tests {
         assert_eq!(current.last_heartbeat, 99);
         assert_eq!(current.capacity_used, 1);
         assert_eq!(current.instances[&match_id].state, InstanceState::Running);
+    }
+
+    #[test]
+    fn newer_generation_cannot_discard_authoritative_instances() {
+        let id = ServerId::new();
+        let match_id = MatchId::new();
+        let mut initial = server(id, 1);
+        initial.capacity_used = 1;
+        initial.failures = 3;
+        initial.instances.insert(
+            match_id,
+            Instance {
+                match_id,
+                cost: 1,
+                state: InstanceState::Running,
+                endpoint: Some("old-game".into()),
+                connection_token: Some("secret".into()),
+            },
+        );
+        let limits = ServerLimits {
+            max_capacity: 10,
+            max_instances: 2,
+        };
+        let mut registry = Registry::default();
+        registry.register(initial, limits).unwrap();
+
+        let mut replacement = server(id, 2);
+        replacement.endpoint = "new-control".into();
+        registry.register(replacement, limits).unwrap();
+
+        let current = &registry.servers[&id];
+        assert_eq!(current.generation, ServerGeneration(2));
+        assert_eq!(current.capacity_used, 1);
+        assert_eq!(current.failures, 3);
+        assert_eq!(current.instances[&match_id].state, InstanceState::Running);
+        assert_eq!(
+            current.instances[&match_id].connection_token.as_deref(),
+            Some("secret")
+        );
+
+        let mut forged = server(id, 3);
+        let unknown = MatchId::new();
+        forged.instances.insert(
+            unknown,
+            Instance {
+                match_id: unknown,
+                cost: 1,
+                state: InstanceState::Running,
+                endpoint: Some("unknown".into()),
+                connection_token: Some("unknown".into()),
+            },
+        );
+        forged.capacity_used = 1;
+        assert_eq!(
+            registry.register(forged, limits),
+            Err(ServerError::UnknownInstance)
+        );
+        assert_eq!(registry.servers[&id].generation, ServerGeneration(2));
     }
 }

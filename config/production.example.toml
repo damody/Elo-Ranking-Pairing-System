@@ -1,0 +1,49 @@
+# Copy this file outside the source tree and replace both certificate paths.
+# Player and game-server token maps are deliberately not stored in TOML; set
+# ERPS_AUTH_TOKEN_MAP and ERPS_SERVER_AUTH_TOKEN_MAP to the JSON contents read
+# from protected files (the environment variables do not accept file paths).
+allow_development_plaintext = false
+tls_certificate_path = "C:/secure/erps/server-chain.pem"
+tls_private_key_path = "C:/secure/erps/server-key.pem"
+
+deterministic_seed = 1163022419
+command_queue_capacity = 65536
+event_queue_capacity = 1024
+control_queue_capacity = 1024
+batch_window_ms = 3
+ready_timeout_seconds = 15
+placement_timeout_seconds = 15
+disconnect_grace_seconds = 30
+heartbeat_interval_seconds = 2
+unhealthy_after_missed = 3
+lost_after_seconds = 10
+graceful_shutdown_seconds = 10
+
+# These are trusted ceilings. A registering game server may report lower
+# capacity/max_instances, but cannot raise them or change the approved costs.
+[server_classes.small]
+capacity_limit = 20
+max_instances = 4
+
+[server_classes.small.mode_costs]
+"1v1" = 1
+"5v5" = 5
+"ffa8" = 4
+
+[server_classes.standard]
+capacity_limit = 100
+max_instances = 20
+
+[server_classes.standard.mode_costs]
+"1v1" = 1
+"5v5" = 5
+"ffa8" = 4
+
+[server_classes.high_capacity]
+capacity_limit = 500
+max_instances = 100
+
+[server_classes.high_capacity.mode_costs]
+"1v1" = 1
+"5v5" = 5
+"ffa8" = 4
