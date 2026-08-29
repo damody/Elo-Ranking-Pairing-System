@@ -193,6 +193,30 @@ mod tests {
         ErpsConfig::default().validate().unwrap();
     }
     #[test]
+    fn shipped_development_config_loads_and_defines_all_mode_costs() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/development.toml");
+        let config = ErpsConfig::load(path).unwrap();
+        assert!(config.allow_development_plaintext);
+        let standard = &config.server_classes["standard"];
+        assert_eq!(standard.max_instances, 20);
+        assert_eq!(standard.mode_costs.len(), 3);
+        assert!(standard.mode_costs.values().all(|cost| *cost > 0));
+    }
+    #[test]
+    fn shipped_production_example_is_tls_only_and_has_trusted_server_classes() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/production.example.toml");
+        let config = ErpsConfig::load(path).unwrap();
+        assert!(!config.allow_development_plaintext);
+        assert!(config.tls_certificate_path.is_some());
+        assert!(config.tls_private_key_path.is_some());
+        assert_eq!(config.server_classes.len(), 3);
+        for policy in config.server_classes.values() {
+            assert!((1..=100).contains(&policy.max_instances));
+            assert_eq!(policy.mode_costs.len(), 3);
+            assert!(policy.mode_costs.values().all(|cost| *cost > 0));
+        }
+    }
+    #[test]
     fn zero_queue_is_rejected() {
         let mut c = ErpsConfig::default();
         c.command_queue_capacity = 0;

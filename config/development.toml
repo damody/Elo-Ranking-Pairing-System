@@ -1,0 +1,26 @@
+# Loopback-only development configuration. Production must disable plaintext and
+# configure both TLS paths plus ERPS_AUTH_TOKEN_MAP / ERPS_SERVER_AUTH_TOKEN_MAP.
+allow_development_plaintext = true
+deterministic_seed = 1163022419
+
+command_queue_capacity = 65536
+event_queue_capacity = 1024
+control_queue_capacity = 1024
+batch_window_ms = 3
+
+ready_timeout_seconds = 15
+placement_timeout_seconds = 15
+disconnect_grace_seconds = 30
+heartbeat_interval_seconds = 2
+unhealthy_after_missed = 3
+lost_after_seconds = 10
+graceful_shutdown_seconds = 10
+
+[server_classes.standard]
+capacity_limit = 100
+max_instances = 20
+
+[server_classes.standard.mode_costs]
+"1v1" = 1
+"5v5" = 5
+"ffa8" = 4

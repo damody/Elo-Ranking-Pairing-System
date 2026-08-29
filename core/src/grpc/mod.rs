@@ -638,6 +638,39 @@ impl AuthorityState {
                     }
                 }
             }
+            let reason = match decision.credit_cause {
+                Some(crate::credit::CreditCause::Rejected) => "rejected",
+                Some(crate::credit::CreditCause::TimedOut) => "timed_out",
+                Some(crate::credit::CreditCause::InfrastructureFailure) => "infrastructure_failure",
+                Some(crate::credit::CreditCause::CompletedMatch) => "completed",
+                None if decision.party_not_ready => "party_member_failed",
+                None => "other_player_failed",
+            };
+            let suspended_until = self
+                .credit_suspended_until
+                .get(&decision.player)
+                .copied()
+                .unwrap_or(0);
+            let credit = self.credit.get(&decision.player).copied().unwrap_or(100);
+            if let Some(sender) = self.events.get(&decision.player) {
+                let _ = sender.send(pb::ClientEvent {
+                    event: Some(pb::client_event::Event::ProposalCancelled(
+                        pb::ProposalCancelledEvent {
+                            proposal_id: proposal_id.to_string(),
+                            reason: reason.into(),
+                            credit: u32::from(credit),
+                            eligible: !credit_suspension_active(
+                                credit,
+                                self.config.minimum_credit,
+                                Some(suspended_until),
+                                now_ms(),
+                            ),
+                            credit_suspended_until_ms: suspended_until as i64,
+                        },
+                    )),
+                    deadline_ms: 0,
+                });
+            }
         }
         for (party_id, ticket) in saved {
             let party_failed = self.parties.get(&party_id).is_some_and(|party| {
@@ -659,6 +692,15 @@ impl AuthorityState {
                     self.tickets.insert(party_id, ticket);
                 }
                 party.revision = party.revision.saturating_add(1);
+            }
+        }
+        let changed_parties: BTreeSet<_> = affected_players
+            .iter()
+            .filter_map(|player| self.player_party.get(player).copied())
+            .collect();
+        for party_id in changed_parties {
+            if let Some(party) = self.parties.get(&party_id) {
+                self.emit_party(party);
             }
         }
         for player in affected_players {
@@ -705,17 +747,81 @@ impl AuthorityState {
             members: party
                 .members
                 .iter()
-                .map(|id| pb::PlayerView {
-                    player_id: id.to_string(),
-                    rating: *self
-                        .ratings
-                        .get(&(*id, QueueMode::OneVsOne))
-                        .unwrap_or(&1000),
-                    credit: u32::from(self.credit.get(id).copied().unwrap_or(100)),
-                })
+                .map(|id| self.player_view(*id))
                 .collect(),
             revision: party.revision,
             state: format!("{:?}", party.state),
+        }
+    }
+    fn player_view(&self, player: PlayerId) -> pb::PlayerView {
+        let rating = |mode| *self.ratings.get(&(player, mode)).unwrap_or(&1000);
+        pb::PlayerView {
+            player_id: player.to_string(),
+            rating: rating(QueueMode::OneVsOne),
+            credit: u32::from(self.credit.get(&player).copied().unwrap_or(100)),
+            rating_one_v_one: rating(QueueMode::OneVsOne),
+            rating_five_v_five: rating(QueueMode::FiveVsFive),
+            rating_free_for_all: rating(QueueMode::FreeForAll),
+        }
+    }
+    fn client_state(&self, player: PlayerId) -> pb::ClientState {
+        let party = self
+            .player_party
+            .get(&player)
+            .and_then(|id| self.parties.get(id));
+        let ticket = party.and_then(|p| self.tickets.get(&p.id));
+        let proposal_id = self.player_proposal.get(&player);
+        let proposal = proposal_id.and_then(|proposal_id| self.proposals.get(proposal_id));
+        let proposal_regions = proposal_id
+            .and_then(|proposal_id| self.proposal_tickets.get(proposal_id))
+            .and_then(|tickets| {
+                tickets
+                    .iter()
+                    .map(|(_, ticket)| ticket.regions.iter().cloned().collect::<BTreeSet<_>>())
+                    .reduce(|left, right| left.intersection(&right).cloned().collect())
+            })
+            .map(|regions| regions.into_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let credit = self.credit.get(&player).copied().unwrap_or(100);
+        let suspended_until = self
+            .credit_suspended_until
+            .get(&player)
+            .copied()
+            .filter(|deadline| {
+                credit_suspension_active(
+                    credit,
+                    self.config.minimum_credit,
+                    Some(*deadline),
+                    now_ms(),
+                )
+            })
+            .unwrap_or(0);
+        pb::ClientState {
+            player_id: player.to_string(),
+            party: party.map(|party| self.party_view(party)),
+            ticket_id: ticket.map(|t| t.id.to_string()).unwrap_or_default(),
+            proposal_id: self
+                .player_proposal
+                .get(&player)
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            match_id: self
+                .player_match
+                .get(&player)
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            profile: Some(self.player_view(player)),
+            credit_suspended_until_ms: suspended_until as i64,
+            queue_mode: ticket
+                .map(|ticket| pb_mode(ticket.mode))
+                .or_else(|| proposal.map(|proposal| pb_mode(proposal_mode(proposal))))
+                .unwrap_or(pb::QueueMode::Unspecified as i32),
+            allowed_regions: ticket
+                .map(|ticket| ticket.regions.clone())
+                .unwrap_or(proposal_regions),
+            proposal_deadline_ms: proposal
+                .map(|proposal| proposal.deadline as i64)
+                .unwrap_or(0),
         }
     }
     fn cached(&self, p: PlayerId, r: &str) -> Option<pb::OperationResult> {
@@ -1036,7 +1142,8 @@ impl AuthorityState {
             })
             .filter_map(|s| {
                 let cost = s.mode_costs.get(&mode).copied()?;
-                let remaining = s.capacity_total.checked_sub(s.capacity_used + cost)?;
+                let required = s.capacity_used.checked_add(cost)?;
+                let remaining = s.capacity_total.checked_sub(required)?;
                 let load_ppm =
                     u64::from(s.capacity_used) * 1_000_000 / u64::from(s.capacity_total.max(1));
                 Some((remaining, load_ppm, s.failures, s.instances.len(), s.id))
@@ -1167,11 +1274,16 @@ impl AuthorityState {
     ) -> Result<(), Status> {
         let match_id = MatchId::from_str(&result.match_id)
             .map_err(|_| Status::invalid_argument("match_id"))?;
-        let (_, proposal_id) = self
+        let (owner, proposal_id) = self
             .launches
             .get(&match_id)
             .copied()
             .ok_or_else(|| Status::not_found("launch"))?;
+        if owner != server_id {
+            return Err(Status::permission_denied(
+                "launch belongs to another server",
+            ));
+        }
         let proposal = self
             .proposals
             .get(&proposal_id)
@@ -1186,9 +1298,41 @@ impl AuthorityState {
             .get_mut(&match_id)
             .ok_or_else(|| Status::not_found("instance"))?;
         if result.state.eq_ignore_ascii_case("accepted") {
-            instance.state = InstanceState::Accepted;
+            match instance.state {
+                InstanceState::Reserved => instance.state = InstanceState::Accepted,
+                InstanceState::Accepted => return Ok(()),
+                _ => {
+                    return Err(Status::failed_precondition(
+                        "launch acceptance is only valid for a reserved instance",
+                    ));
+                }
+            }
             tracing::info!(%match_id, %server_id, "game instance accepted launch");
         } else if result.state.eq_ignore_ascii_case("ready") {
+            if result.endpoint.trim().is_empty() || result.connection_token.trim().is_empty() {
+                return Err(Status::invalid_argument(
+                    "ready launch requires endpoint and connection_token",
+                ));
+            }
+            if !matches!(
+                instance.state,
+                InstanceState::Accepted | InstanceState::Ready | InstanceState::Running
+            ) {
+                return Err(Status::failed_precondition(
+                    "launch readiness requires an accepted instance",
+                ));
+            }
+            let already_published = proposal
+                .responses
+                .keys()
+                .all(|player| self.player_match.get(player) == Some(&match_id));
+            if already_published {
+                instance.state = InstanceState::Running;
+                instance.endpoint = Some(result.endpoint);
+                instance.connection_token = Some(result.connection_token);
+                self.launch_deadlines.remove(&match_id);
+                return Ok(());
+            }
             if let Some(deadline) = self.launch_deadlines.remove(&match_id) {
                 let started_at =
                     deadline.saturating_sub(self.config.placement_timeout_seconds * 1000);
@@ -1250,10 +1394,22 @@ impl AuthorityState {
             for party in &matched_parties {
                 self.emit_party(party);
             }
-        } else {
+        } else if result.state.eq_ignore_ascii_case("rejected")
+            || result.state.eq_ignore_ascii_case("failed")
+        {
+            if !matches!(
+                instance.state,
+                InstanceState::Reserved | InstanceState::Accepted
+            ) {
+                return Err(Status::failed_precondition(
+                    "launch rejection is only valid before an instance is ready",
+                ));
+            }
             self.metrics.launch_failures.add(1);
             let _ = server;
             self.retry_launch(match_id, server_id, proposal_id)?;
+        } else {
+            return Err(Status::invalid_argument("unknown launch result state"));
         }
         Ok(())
     }
@@ -1288,14 +1444,34 @@ impl AuthorityState {
                     .servers
                     .get_mut(&id)
                     .ok_or_else(|| Status::not_found("server"))?;
-                if let Some(instance) = server.instances.get_mut(&match_id) {
-                    let previous = instance.state;
-                    instance.state = parse_instance(&value.state)?;
-                    if instance.state == InstanceState::Finished
-                        && previous != InstanceState::Finished
-                    {
-                        server.capacity_used = server.capacity_used.saturating_sub(instance.cost);
-                    }
+                let instance = server
+                    .instances
+                    .get_mut(&match_id)
+                    .ok_or_else(|| Status::not_found("instance"))?;
+                if instance.cost != value.reserved_cost {
+                    return Err(Status::failed_precondition(
+                        "reported instance cost differs from reservation",
+                    ));
+                }
+                let previous = instance.state;
+                let next = parse_instance(&value.state)?;
+                if !valid_reported_instance_transition(previous, next) {
+                    return Err(Status::failed_precondition(
+                        "invalid game instance lifecycle transition",
+                    ));
+                }
+                if matches!(next, InstanceState::Ready | InstanceState::Running)
+                    && (value.endpoint.trim().is_empty()
+                        || value.connection_token.trim().is_empty())
+                {
+                    return Err(Status::invalid_argument(
+                        "ready or running instance requires endpoint and connection_token",
+                    ));
+                }
+                instance.state = next;
+                if matches!(next, InstanceState::Ready | InstanceState::Running) {
+                    instance.endpoint = Some(value.endpoint);
+                    instance.connection_token = Some(value.connection_token);
                 }
             }
             Some(pb::server_control::Message::MatchResult(result)) => {
@@ -1328,30 +1504,57 @@ impl AuthorityState {
         if owner != server_id {
             return Err(Status::permission_denied("match belongs to another server"));
         }
+        let instance = self
+            .registry
+            .servers
+            .get(&server_id)
+            .and_then(|server| server.instances.get(&match_id))
+            .ok_or_else(|| Status::not_found("instance"))?;
+        if instance.state != InstanceState::Running {
+            return Err(Status::failed_precondition(
+                "match result requires a running instance",
+            ));
+        }
         let proposal = self
             .proposals
             .get(&proposal_id)
             .cloned()
             .ok_or_else(|| Status::not_found("proposal"))?;
         let mode = proposal_mode(&proposal);
-        let ranks: BTreeMap<PlayerId, u8> = result
-            .placements
-            .into_iter()
-            .map(|placement| {
-                let player = PlayerId::from_str(&placement.player_id)
-                    .map_err(|_| Status::invalid_argument("placement player_id"))?;
-                let rank = u8::try_from(placement.rank)
-                    .ok()
-                    .filter(|rank| *rank > 0)
-                    .ok_or_else(|| Status::invalid_argument("placement rank"))?;
-                Ok((player, rank))
-            })
-            .collect::<Result<_, Status>>()?;
+        let mut ranks = BTreeMap::new();
+        for placement in result.placements {
+            let player = PlayerId::from_str(&placement.player_id)
+                .map_err(|_| Status::invalid_argument("placement player_id"))?;
+            let rank = u8::try_from(placement.rank)
+                .ok()
+                .filter(|rank| *rank > 0)
+                .ok_or_else(|| Status::invalid_argument("placement rank"))?;
+            if ranks.insert(player, rank).is_some() {
+                return Err(Status::invalid_argument("duplicate placement player"));
+            }
+        }
         let roster: BTreeSet<_> = proposal.teams.iter().flatten().copied().collect();
         if ranks.keys().copied().collect::<BTreeSet<_>>() != roster {
             return Err(Status::invalid_argument(
                 "placements must cover the exact roster",
             ));
+        }
+        if ranks.values().any(|rank| usize::from(*rank) > roster.len()) {
+            return Err(Status::invalid_argument("placement rank exceeds roster"));
+        }
+        if mode == QueueMode::FiveVsFive {
+            let team_rank = |team: &[PlayerId]| {
+                team.first()
+                    .and_then(|first| ranks.get(first).copied())
+                    .filter(|rank| team.iter().all(|player| ranks.get(player) == Some(rank)))
+            };
+            let first = team_rank(&proposal.teams[0]);
+            let second = team_rank(&proposal.teams[1]);
+            if first.is_none() || second.is_none() || first == second {
+                return Err(Status::invalid_argument(
+                    "5v5 placements require one consistent, distinct rank per team",
+                ));
+            }
         }
         let policy = crate::rating::RatingPolicy {
             established_k: self.config.elo_established_k,
@@ -1450,10 +1653,16 @@ impl AuthorityState {
             self.pending_profile_saves
                 .push((player, self.current_profile(player)));
         }
-        for party_id in proposal.parties.values().copied().collect::<BTreeSet<_>>() {
-            if let Some(party) = self.parties.get_mut(&party_id) {
+        let finished_parties = proposal.parties.values().copied().collect::<BTreeSet<_>>();
+        for party_id in &finished_parties {
+            if let Some(party) = self.parties.get_mut(party_id) {
                 party.state = PartyState::Idle;
                 party.revision = party.revision.saturating_add(1);
+            }
+        }
+        for party_id in finished_parties {
+            if let Some(party) = self.parties.get(&party_id) {
+                self.emit_party(party);
             }
         }
         crate::placement::release(&mut self.registry, server_id, match_id)
@@ -2041,23 +2250,7 @@ impl MatchmakingService for MatchmakingGrpc {
             .core
             .call(move |s| {
                 let player = s.player(&req.session_token)?;
-                let party = s.player_party.get(&player).and_then(|id| s.parties.get(id));
-                let ticket = party.and_then(|p| s.tickets.get(&p.id));
-                Ok(pb::ClientState {
-                    player_id: player.to_string(),
-                    party: party.map(|party| s.party_view(party)),
-                    ticket_id: ticket.map(|t| t.id.to_string()).unwrap_or_default(),
-                    proposal_id: s
-                        .player_proposal
-                        .get(&player)
-                        .map(ToString::to_string)
-                        .unwrap_or_default(),
-                    match_id: s
-                        .player_match
-                        .get(&player)
-                        .map(ToString::to_string)
-                        .unwrap_or_default(),
-                })
+                Ok(s.client_state(player))
             })
             .await?;
         Ok(Response::new(value))
@@ -2202,17 +2395,23 @@ impl GameServerService for GameServerGrpc {
                 for reported in req.instances {
                     let match_id = MatchId::from_str(&reported.match_id)
                         .map_err(|_| Status::invalid_argument("instance match_id"))?;
-                    instances.insert(
-                        match_id,
-                        Instance {
+                    if instances
+                        .insert(
                             match_id,
-                            cost: reported.reserved_cost,
-                            state: parse_instance(&reported.state)?,
-                            endpoint: (!reported.endpoint.is_empty()).then_some(reported.endpoint),
-                            connection_token: (!reported.connection_token.is_empty())
-                                .then_some(reported.connection_token),
-                        },
-                    );
+                            Instance {
+                                match_id,
+                                cost: reported.reserved_cost,
+                                state: parse_instance(&reported.state)?,
+                                endpoint: (!reported.endpoint.is_empty())
+                                    .then_some(reported.endpoint),
+                                connection_token: (!reported.connection_token.is_empty())
+                                    .then_some(reported.connection_token),
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(Status::invalid_argument("duplicate instance match_id"));
+                    }
                 }
                 let capacity_used = instances
                     .values()
@@ -2222,8 +2421,8 @@ impl GameServerService for GameServerGrpc {
                             InstanceState::Finished | InstanceState::ServerLost
                         )
                     })
-                    .map(|instance| instance.cost)
-                    .sum();
+                    .try_fold(0_u32, |used, instance| used.checked_add(instance.cost))
+                    .ok_or_else(|| Status::invalid_argument("instance capacity overflow"))?;
                 let server = GameServer {
                     id,
                     generation: ServerGeneration(req.generation),
@@ -2261,6 +2460,9 @@ impl GameServerService for GameServerGrpc {
                             .ok_or_else(|| Status::permission_denied("unknown server class"))?,
                     )
                     .map_err(|e| Status::failed_precondition(e.to_string()))?;
+                // Registration starts a new control-session handshake. Never leave the previous
+                // generation's sender eligible to receive launches during this gap.
+                s.controls.remove(&id);
                 Ok(pb::RegisterServerResponse {
                     accepted: true,
                     code: "OK".into(),
@@ -2336,17 +2538,22 @@ impl GameServerService for GameServerGrpc {
                             reason: String::new(),
                         });
                     }
-                    instances.insert(
-                        mid,
-                        Instance {
-                            match_id: mid,
-                            cost: i.reserved_cost,
-                            state,
-                            endpoint: (!i.endpoint.is_empty()).then_some(i.endpoint),
-                            connection_token: (!i.connection_token.is_empty())
-                                .then_some(i.connection_token),
-                        },
-                    );
+                    if instances
+                        .insert(
+                            mid,
+                            Instance {
+                                match_id: mid,
+                                cost: i.reserved_cost,
+                                state,
+                                endpoint: (!i.endpoint.is_empty()).then_some(i.endpoint),
+                                connection_token: (!i.connection_token.is_empty())
+                                    .then_some(i.connection_token),
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(Status::invalid_argument("duplicate instance match_id"));
+                    }
                 }
                 s.registry
                     .reconcile(id, ServerGeneration(req.generation), instances)
@@ -2381,6 +2588,16 @@ fn parse_instance(v: &str) -> Result<InstanceState, Status> {
         "serverlost" | "server_lost" => Ok(InstanceState::ServerLost),
         _ => Err(Status::invalid_argument("instance state")),
     }
+}
+
+fn valid_reported_instance_transition(previous: InstanceState, next: InstanceState) -> bool {
+    previous == next
+        || matches!(
+            (previous, next),
+            (InstanceState::Reserved, InstanceState::Accepted)
+                | (InstanceState::Accepted, InstanceState::Ready)
+                | (InstanceState::Ready, InstanceState::Running)
+        )
 }
 
 fn latency_summary(stage: &str, histogram: &crate::metrics::Histogram) -> pb::LatencySummary {
@@ -2563,6 +2780,12 @@ pub async fn serve_with_validators(
     reporter
         .set_serving::<pb::matchmaking_service_server::MatchmakingServiceServer<MatchmakingGrpc>>()
         .await;
+    reporter
+        .set_serving::<pb::game_server_service_server::GameServerServiceServer<GameServerGrpc>>()
+        .await;
+    reporter
+        .set_serving::<pb::admin_service_server::AdminServiceServer<AdminGrpc>>()
+        .await;
     if drain_mode {
         reporter.set_not_serving::<pb::matchmaking_service_server::MatchmakingServiceServer<MatchmakingGrpc>>().await;
     }
@@ -2614,6 +2837,70 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+    #[tokio::test]
+    async fn successful_server_reregistration_clears_previous_control_sender() {
+        let core = CoreHandle::spawn(ErpsConfig::default());
+        let server_id = ServerId::new();
+        let (sender, _receiver) = mpsc::channel(1);
+        core.call(move |state| {
+            state
+                .registry
+                .register(
+                    GameServer {
+                        id: server_id,
+                        generation: ServerGeneration(1),
+                        endpoint: "game".into(),
+                        region: "tw".into(),
+                        modes: BTreeSet::from([QueueMode::OneVsOne]),
+                        capacity_total: 10,
+                        capacity_used: 0,
+                        max_instances: 2,
+                        mode_costs: BTreeMap::from([(QueueMode::OneVsOne, 1)]),
+                        last_heartbeat: 1,
+                        health: Health::Healthy,
+                        failures: 0,
+                        instances: BTreeMap::new(),
+                    },
+                    ServerLimits {
+                        max_capacity: u32::MAX,
+                        max_instances: 100,
+                    },
+                )
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            state.controls.insert(server_id, sender);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let service = GameServerGrpc::new(core.clone());
+        service
+            .register(Request::new(pb::RegisterServerRequest {
+                api: Some(pb::ApiVersion {
+                    major: 1,
+                    minor: 0,
+                    capabilities: vec![],
+                }),
+                auth_token: server_id.to_string(),
+                server_id: server_id.to_string(),
+                generation: 1,
+                endpoint: "game".into(),
+                region: "tw".into(),
+                capacity_total: 10,
+                max_instances: 2,
+                mode_costs: vec![pb::ModeCost {
+                    mode: pb::QueueMode::OneVOne as i32,
+                    cost: 1,
+                }],
+                instances: vec![],
+                server_class: String::new(),
+            }))
+            .await
+            .unwrap();
+        assert!(!core
+            .call(move |state| Ok(state.controls.contains_key(&server_id)))
+            .await
+            .unwrap());
     }
     #[test]
     fn admin_metrics_exposes_counters_high_watermarks_and_latency() {
@@ -2763,6 +3050,40 @@ mod tests {
             state.registry.servers[&server_id].instances[&match_id].state,
             InstanceState::Running
         );
+
+        let (sender, _receiver) = mpsc::channel(1);
+        let cost_error = state
+            .apply_server_control(
+                server_id,
+                ServerGeneration(2),
+                sender,
+                Some(pb::server_control::Message::Instance(pb::InstanceState {
+                    match_id: match_id.to_string(),
+                    state: "running".into(),
+                    reserved_cost: 2,
+                    endpoint: "game".into(),
+                    connection_token: "secret".into(),
+                })),
+            )
+            .unwrap_err();
+        assert_eq!(cost_error.code(), tonic::Code::FailedPrecondition);
+
+        let (sender, _receiver) = mpsc::channel(1);
+        let unknown_error = state
+            .apply_server_control(
+                server_id,
+                ServerGeneration(2),
+                sender,
+                Some(pb::server_control::Message::Instance(pb::InstanceState {
+                    match_id: MatchId::new().to_string(),
+                    state: "running".into(),
+                    reserved_cost: 1,
+                    endpoint: "game".into(),
+                    connection_token: "secret".into(),
+                })),
+            )
+            .unwrap_err();
+        assert_eq!(unknown_error.code(), tonic::Code::NotFound);
     }
     #[test]
     fn completed_match_result_idempotency_cache_is_bounded() {
@@ -2844,7 +3165,7 @@ mod tests {
             .tls_config(
                 ClientTlsConfig::new()
                     .domain_name("localhost")
-                    .ca_certificate(Certificate::from_pem(certificate_pem)),
+                    .ca_certificate(Certificate::from_pem(&certificate_pem)),
             )
             .unwrap()
             .connect()
@@ -2901,6 +3222,70 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(opened.player_id, player.to_string());
+        let sdk = erps_client::Client::connect(erps_client::ConnectOptions::tls_with_ca(
+            format!("https://localhost:{}", addr.port()),
+            "signed-player",
+            "localhost",
+            certificate_pem.as_bytes(),
+        ))
+        .await
+        .unwrap();
+        let expected_player = player.to_string();
+        assert_eq!(sdk.player_id(), Some(expected_player.as_str()));
+        let _ = stop_tx.send(());
+        running.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn grpc_health_reports_every_public_service() {
+        use tonic::server::NamedService;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let running = tokio::spawn(serve(
+            addr,
+            ErpsConfig {
+                allow_development_plaintext: true,
+                graceful_shutdown_seconds: 1,
+                ..Default::default()
+            },
+            async move {
+                let _ = stop_rx.await;
+            },
+        ));
+        let endpoint = format!("http://{addr}");
+        let mut health = loop {
+            match tonic::transport::Endpoint::from_shared(endpoint.clone())
+                .unwrap()
+                .connect()
+                .await
+            {
+                Ok(channel) => {
+                    break tonic_health::pb::health_client::HealthClient::new(channel);
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        };
+        for service in [
+            <pb::matchmaking_service_server::MatchmakingServiceServer<MatchmakingGrpc> as NamedService>::NAME,
+            <pb::game_server_service_server::GameServerServiceServer<GameServerGrpc> as NamedService>::NAME,
+            <pb::admin_service_server::AdminServiceServer<AdminGrpc> as NamedService>::NAME,
+        ] {
+            let response = health
+                .check(tonic_health::pb::HealthCheckRequest {
+                    service: service.into(),
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                response.status,
+                tonic_health::pb::health_check_response::ServingStatus::Serving as i32,
+                "{service} was not reported serving"
+            );
+        }
         let _ = stop_tx.send(());
         running.await.unwrap().unwrap();
     }
@@ -3166,9 +3551,21 @@ mod tests {
             );
             state.parties.insert(party_id, party);
         }
+        let mut receivers = Vec::new();
+        for player in players {
+            let (sender, receiver) = broadcast::channel(8);
+            state.events.insert(player, sender);
+            receivers.push(receiver);
+        }
         state.attempt_match_batch(QueueMode::OneVsOne, "tw");
         let proposal_id = *state.proposals.keys().next().unwrap();
         let deadline = state.proposals[&proposal_id].deadline;
+        let reconnected = state.client_state(players[0]);
+        assert_eq!(reconnected.proposal_id, proposal_id.to_string());
+        assert_eq!(reconnected.queue_mode, pb::QueueMode::OneVOne as i32);
+        assert_eq!(reconnected.allowed_regions, vec!["tw"]);
+        assert_eq!(reconnected.proposal_deadline_ms, deadline as i64);
+        assert!(reconnected.profile.is_some());
         state
             .proposals
             .get_mut(&proposal_id)
@@ -3186,7 +3583,70 @@ mod tests {
             state.parties[&state.player_party[&players[1]]].state,
             PartyState::NotReady
         );
+        for (index, receiver) in receivers.iter_mut().enumerate() {
+            assert!(matches!(
+                receiver.try_recv().unwrap().event,
+                Some(pb::client_event::Event::ProposalId(_))
+            ));
+            let cancelled = receiver.try_recv().unwrap();
+            let Some(pb::client_event::Event::ProposalCancelled(cancelled)) = cancelled.event
+            else {
+                panic!("player must receive an explicit proposal cancellation");
+            };
+            assert_eq!(cancelled.credit, if index == 0 { 100 } else { 95 });
+            assert!(cancelled.eligible);
+            assert_eq!(
+                cancelled.reason,
+                if index == 0 {
+                    "other_player_failed"
+                } else {
+                    "timed_out"
+                }
+            );
+            let update = receiver.try_recv().unwrap();
+            let Some(pb::client_event::Event::Party(party)) = update.event else {
+                panic!("player must receive a party update after ready timeout");
+            };
+            assert_eq!(party.members[0].credit, if index == 0 { 100 } else { 95 });
+            assert_eq!(party.state, if index == 0 { "Queued" } else { "NotReady" });
+        }
     }
+    #[test]
+    fn reported_instance_state_requires_the_ordered_lifecycle() {
+        assert!(valid_reported_instance_transition(
+            InstanceState::Reserved,
+            InstanceState::Accepted
+        ));
+        assert!(valid_reported_instance_transition(
+            InstanceState::Accepted,
+            InstanceState::Ready
+        ));
+        assert!(valid_reported_instance_transition(
+            InstanceState::Ready,
+            InstanceState::Running
+        ));
+        assert!(!valid_reported_instance_transition(
+            InstanceState::Running,
+            InstanceState::Finished
+        ));
+        assert!(valid_reported_instance_transition(
+            InstanceState::Running,
+            InstanceState::Running
+        ));
+        assert!(!valid_reported_instance_transition(
+            InstanceState::Reserved,
+            InstanceState::Ready
+        ));
+        assert!(!valid_reported_instance_transition(
+            InstanceState::Finished,
+            InstanceState::Running
+        ));
+        assert!(!valid_reported_instance_transition(
+            InstanceState::Running,
+            InstanceState::ServerLost
+        ));
+    }
+
     #[test]
     fn authority_domain_id_allocator_is_seeded_and_repeatable() {
         let config = ErpsConfig {
@@ -3214,7 +3674,19 @@ mod tests {
             quality_key: (0, 0, 0),
             owner_shard: 0,
         };
-        let mut proposal = Proposal::from_candidate(&candidate, BTreeMap::new(), 0, 15);
+        let mut owners = BTreeMap::new();
+        let mut player_events = Vec::new();
+        for player in players {
+            let mut party = Party::new(player, "ResultParty").unwrap();
+            party.state = PartyState::Matched;
+            owners.insert(player, party.id);
+            state.player_party.insert(player, party.id);
+            state.parties.insert(party.id, party);
+            let (sender, receiver) = broadcast::channel(8);
+            state.events.insert(player, sender);
+            player_events.push(receiver);
+        }
+        let mut proposal = Proposal::from_candidate(&candidate, owners, 0, 15);
         proposal.state = ProposalState::AwaitingPlacement;
         let proposal_id = proposal.id;
         state.proposals.insert(proposal_id, proposal);
@@ -3247,6 +3719,120 @@ mod tests {
         crate::placement::reserve(&mut state.registry, match_id, QueueMode::OneVsOne, "tw")
             .unwrap();
         state.launches.insert(match_id, (server_id, proposal_id));
+        let foreign_launch = state
+            .launch_result(
+                ServerId::new(),
+                pb::LaunchResult {
+                    match_id: match_id.to_string(),
+                    state: "ready".into(),
+                    endpoint: "foreign-game".into(),
+                    connection_token: "foreign-token".into(),
+                    reason: String::new(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(foreign_launch.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            state.registry.servers[&server_id].instances[&match_id].state,
+            InstanceState::Reserved
+        );
+        let premature_ready = state
+            .launch_result(
+                server_id,
+                pb::LaunchResult {
+                    match_id: match_id.to_string(),
+                    state: "ready".into(),
+                    endpoint: "game".into(),
+                    connection_token: "token".into(),
+                    reason: String::new(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(premature_ready.code(), tonic::Code::FailedPrecondition);
+        state
+            .launch_result(
+                server_id,
+                pb::LaunchResult {
+                    match_id: match_id.to_string(),
+                    state: "accepted".into(),
+                    endpoint: String::new(),
+                    connection_token: String::new(),
+                    reason: String::new(),
+                },
+            )
+            .unwrap();
+        let premature_result = state
+            .finish_match(
+                server_id,
+                pb::MatchResult {
+                    match_id: match_id.to_string(),
+                    placements: vec![
+                        pb::PlayerPlacement {
+                            player_id: players[0].to_string(),
+                            rank: 1,
+                        },
+                        pb::PlayerPlacement {
+                            player_id: players[1].to_string(),
+                            rank: 2,
+                        },
+                    ],
+                },
+            )
+            .unwrap_err();
+        assert_eq!(premature_result.code(), tonic::Code::FailedPrecondition);
+        assert!(state.ratings.is_empty());
+        assert_eq!(state.registry.servers[&server_id].capacity_used, 1);
+        let incomplete_ready = state
+            .launch_result(
+                server_id,
+                pb::LaunchResult {
+                    match_id: match_id.to_string(),
+                    state: "ready".into(),
+                    endpoint: "game".into(),
+                    connection_token: String::new(),
+                    reason: String::new(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(incomplete_ready.code(), tonic::Code::InvalidArgument);
+        let ready = pb::LaunchResult {
+            match_id: match_id.to_string(),
+            state: "ready".into(),
+            endpoint: "game".into(),
+            connection_token: "token".into(),
+            reason: String::new(),
+        };
+        state.launch_result(server_id, ready.clone()).unwrap();
+        assert_eq!(
+            state.registry.servers[&server_id].instances[&match_id].state,
+            InstanceState::Running
+        );
+        state.launch_result(server_id, ready).unwrap();
+        assert_eq!(state.player_match.len(), players.len());
+        let duplicate_result = state
+            .finish_match(
+                server_id,
+                pb::MatchResult {
+                    match_id: match_id.to_string(),
+                    placements: vec![
+                        pb::PlayerPlacement {
+                            player_id: players[0].to_string(),
+                            rank: 1,
+                        },
+                        pb::PlayerPlacement {
+                            player_id: players[0].to_string(),
+                            rank: 1,
+                        },
+                        pb::PlayerPlacement {
+                            player_id: players[1].to_string(),
+                            rank: 2,
+                        },
+                    ],
+                },
+            )
+            .unwrap_err();
+        assert_eq!(duplicate_result.code(), tonic::Code::InvalidArgument);
+        assert_eq!(state.registry.servers[&server_id].capacity_used, 1);
         state
             .finish_match(
                 server_id,
@@ -3268,6 +3854,23 @@ mod tests {
         assert!(state.ratings[&(players[0], QueueMode::OneVsOne)] > 1000);
         assert!(state.ratings[&(players[1], QueueMode::OneVsOne)] < 1000);
         assert_eq!(state.registry.servers[&server_id].capacity_used, 0);
+        for (index, receiver) in player_events.iter_mut().enumerate() {
+            assert!(matches!(
+                receiver.try_recv().unwrap().event,
+                Some(pb::client_event::Event::Matched(_))
+            ));
+            let update = receiver.try_recv().unwrap();
+            let Some(pb::client_event::Event::Party(party)) = update.event else {
+                panic!("match completion must publish updated Elo and credit");
+            };
+            assert_eq!(party.state, "Idle");
+            let own = &party.members[0];
+            assert_eq!(own.player_id, players[index].to_string());
+            assert_eq!(
+                own.rating_one_v_one,
+                state.ratings[&(players[index], QueueMode::OneVsOne)]
+            );
+        }
     }
     #[test]
     fn launch_uses_common_ticket_region_and_never_cross_region_server() {
