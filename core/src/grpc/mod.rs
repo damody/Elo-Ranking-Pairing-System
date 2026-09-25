@@ -1629,8 +1629,21 @@ impl AuthorityState {
                     .iter()
                     .map(|p| *self.ratings.get(&(*p, mode)).unwrap_or(&1000))
                     .collect();
-                let (next_winners, next_losers) =
-                    crate::rating::team_update(&winner_ratings, &loser_ratings, policy);
+                let winner_completed = winners
+                    .iter()
+                    .map(|player| *self.completed_games.get(&(*player, mode)).unwrap_or(&0))
+                    .collect::<Vec<_>>();
+                let loser_completed = losers
+                    .iter()
+                    .map(|player| *self.completed_games.get(&(*player, mode)).unwrap_or(&0))
+                    .collect::<Vec<_>>();
+                let (next_winners, next_losers) = crate::rating::team_update_with_completed(
+                    &winner_ratings,
+                    &loser_ratings,
+                    &winner_completed,
+                    &loser_completed,
+                    policy,
+                );
                 for (player, rating) in winners.iter().zip(next_winners) {
                     self.ratings.insert((*player, mode), rating);
                 }

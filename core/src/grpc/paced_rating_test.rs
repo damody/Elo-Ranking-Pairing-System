@@ -386,4 +386,81 @@ fn five_v_five_live_queue_releases_structure_after_sixty_seconds() {
     assert!(structures.contains(&vec![4, 1]));
     assert!(structures.contains(&vec![2, 2, 1]));
     assert_eq!(state.tickets.len(), 0);
+
+    let proposal_id = *state.proposals.keys().next().unwrap();
+    let teams = state.proposals[&proposal_id].teams.clone();
+    let seasoned = [teams[0][0], teams[1][0]];
+    let before = teams
+        .iter()
+        .flatten()
+        .map(|player| (*player, state.ratings[&(*player, QueueMode::FiveVsFive)]))
+        .collect::<BTreeMap<_, _>>();
+    for player in seasoned {
+        state
+            .completed_games
+            .insert((player, QueueMode::FiveVsFive), 10);
+    }
+    for player in teams.iter().flatten() {
+        state
+            .proposals
+            .get_mut(&proposal_id)
+            .unwrap()
+            .respond(proposal_id, *player, true)
+            .unwrap();
+    }
+    let match_id = state.launch(proposal_id).unwrap();
+    for lifecycle in ["accepted", "ready"] {
+        state
+            .launch_result(
+                server_id,
+                pb::LaunchResult {
+                    match_id: match_id.to_string(),
+                    state: lifecycle.into(),
+                    endpoint: "game".into(),
+                    connection_token: "token".into(),
+                    reason: String::new(),
+                },
+            )
+            .unwrap();
+    }
+    state
+        .finish_match(
+            server_id,
+            pb::MatchResult {
+                match_id: match_id.to_string(),
+                placements: teams
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(index, team)| {
+                        team.iter().map(move |player| pb::PlayerPlacement {
+                            player_id: player.to_string(),
+                            rank: index as u32 + 1,
+                        })
+                    })
+                    .collect(),
+            },
+        )
+        .unwrap();
+    for (team_index, team) in teams.iter().enumerate() {
+        let other_mean = teams[1 - team_index]
+            .iter()
+            .map(|player| before[player])
+            .sum::<i32>()
+            / 5;
+        for player in team {
+            let current = before[player];
+            let old_games = if seasoned.contains(player) { 10 } else { 0 };
+            let probability = 1.0 / (1.0 + 10f64.powf(f64::from(other_mean - current) / 400.0));
+            let actual = if team_index == 0 { 1.0 } else { 0.0 };
+            let k = if old_games < 10 { 40.0 } else { 20.0 };
+            let expected = current + (k * (actual - probability)).round() as i32;
+            assert_eq!(state.ratings[&(*player, QueueMode::FiveVsFive)], expected);
+            assert_eq!(
+                state.completed_games[&(*player, QueueMode::FiveVsFive)],
+                old_games + 1
+            );
+        }
+    }
+    assert_eq!(state.registry.servers[&server_id].capacity_used, 0);
+    assert!(state.registry.servers[&server_id].instances.is_empty());
 }

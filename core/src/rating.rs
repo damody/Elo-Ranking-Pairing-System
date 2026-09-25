@@ -49,17 +49,39 @@ pub fn one_vs_one(
         b + delta(b, a, 1.0 - a_score, b_completed, p),
     )
 }
+/// Updates teams under the established K factor. Use `team_update_with_completed`
+/// when each player's match history is available.
 pub fn team_update(winners: &[i32], losers: &[i32], p: RatingPolicy) -> (Vec<i32>, Vec<i32>) {
+    team_update_with_completed(
+        winners,
+        losers,
+        &vec![p.provisional_matches; winners.len()],
+        &vec![p.provisional_matches; losers.len()],
+        p,
+    )
+}
+
+pub fn team_update_with_completed(
+    winners: &[i32],
+    losers: &[i32],
+    winner_completed: &[u32],
+    loser_completed: &[u32],
+    p: RatingPolicy,
+) -> (Vec<i32>, Vec<i32>) {
+    assert_eq!(winners.len(), winner_completed.len());
+    assert_eq!(losers.len(), loser_completed.len());
     let wa = mean(winners);
     let la = mean(losers);
     (
         winners
             .iter()
-            .map(|r| *r + delta(*r, la, 1.0, p.provisional_matches, p))
+            .zip(winner_completed)
+            .map(|(rating, completed)| *rating + delta(*rating, la, 1.0, *completed, p))
             .collect(),
         losers
             .iter()
-            .map(|r| *r + delta(*r, wa, 0.0, p.provisional_matches, p))
+            .zip(loser_completed)
+            .map(|(rating, completed)| *rating + delta(*rating, wa, 0.0, *completed, p))
             .collect(),
     )
 }
@@ -115,6 +137,18 @@ mod tests {
         let (w, l) = team_update(&[1000; 5], &[1000; 5], Default::default());
         assert!(w.iter().all(|r| *r > 1000));
         assert!(l.iter().all(|r| *r < 1000));
+    }
+    #[test]
+    fn team_provisional_k_uses_each_players_completed_games() {
+        let (w, l) = team_update_with_completed(
+            &[1000; 5],
+            &[1000; 5],
+            &[0, 9, 10, 11, 20],
+            &[0, 9, 10, 11, 20],
+            Default::default(),
+        );
+        assert_eq!(w, [1020, 1020, 1010, 1010, 1010]);
+        assert_eq!(l, [980, 980, 990, 990, 990]);
     }
     #[test]
     fn ffa_ties_are_draws_and_clamped() {
