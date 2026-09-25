@@ -359,7 +359,32 @@ impl AuthorityState {
                 .build();
         }
         for (party_id, ticket) in &self.tickets {
-            let rating = 1000;
+            let rating = self
+                .parties
+                .get(party_id)
+                .and_then(|party| {
+                    let ratings = party
+                        .members
+                        .iter()
+                        .map(|player| *self.ratings.get(&(*player, ticket.mode)).unwrap_or(&1000))
+                        .collect::<Vec<_>>();
+                    crate::matching::effective_rating_for_mode(
+                        ticket.mode,
+                        &ratings,
+                        self.config.party_size_rating_adjustment,
+                        self.config.party_spread_rating_adjustment,
+                        self.config.max_party_rating_spread,
+                    )
+                })
+                .unwrap_or(1000);
+            let search_delta = crate::matching::bucket::search_delta(
+                self.config.initial_elo_delta,
+                self.config.elo_step,
+                self.config.elo_step_seconds,
+                self.config.maximum_elo_delta,
+                0,
+                now_ms().saturating_sub(ticket.queued_since_ms) / 1000,
+            );
             self.world
                 .create_entity()
                 .with(crate::components::TicketIdentity(ticket.id))
@@ -367,12 +392,12 @@ impl AuthorityState {
                 .with(crate::components::TicketRegions(ticket.regions.clone()))
                 .with(crate::components::EnqueuedAt(ticket.enqueued_at))
                 .with(crate::components::SearchRange {
-                    minimum: rating - self.config.initial_elo_delta,
-                    maximum: rating + self.config.initial_elo_delta,
+                    minimum: rating.saturating_sub(search_delta),
+                    maximum: rating.saturating_add(search_delta),
                 })
                 .with(crate::components::BucketOwner {
                     region: ticket.regions.first().cloned().unwrap_or_default(),
-                    bucket: rating / 100,
+                    bucket: rating.div_euclid(100),
                 })
                 .with(crate::components::TicketState::Queued)
                 .with(crate::components::PartyIdentity(*party_id))
@@ -939,11 +964,17 @@ impl AuthorityState {
                                     .unwrap_or(1000)
                             })
                             .collect();
+                        let wait_seconds = now_ms().saturating_sub(
+                            self.tickets
+                                .get(&party.0)
+                                .map_or(0, |ticket| ticket.queued_since_ms),
+                        ) / 1000;
                         Some(PartyTicket {
                             id: ticket.0,
                             party: party.0,
                             members: members.clone(),
-                            effective_rating: crate::matching::effective_rating(
+                            effective_rating: crate::matching::effective_rating_for_mode(
+                                mode,
                                 &ratings,
                                 self.config.party_size_rating_adjustment,
                                 self.config.party_spread_rating_adjustment,
@@ -960,12 +991,9 @@ impl AuthorityState {
                                 self.config.elo_step_seconds,
                                 self.config.maximum_elo_delta,
                                 0,
-                                now_ms().saturating_sub(
-                                    self.tickets
-                                        .get(&party.0)
-                                        .map_or(0, |ticket| ticket.queued_since_ms),
-                                ) / 1000,
+                                wait_seconds,
                             ),
+                            wait_seconds,
                         })
                     })
                     .flatten()
@@ -2814,6 +2842,9 @@ pub async fn serve_with_validators(
     tokio::select! {result=server=>result?,_=async{let _=drain_rx.await;tokio::time::sleep(grace).await;}=>anyhow::bail!("bounded graceful shutdown deadline exceeded")}
     Ok(())
 }
+
+#[cfg(test)]
+mod paced_rating_test;
 
 #[cfg(test)]
 mod tests {

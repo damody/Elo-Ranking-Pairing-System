@@ -1,4 +1,30 @@
-use super::{Candidate, PartyTicket};
+use super::{five_v_five_party_bonus, Candidate, PartyTicket, FIVE_V_FIVE_MIRROR_SECONDS};
+
+fn structure(group: &[usize], tickets: &[PartyTicket]) -> [u8; 5] {
+    let mut counts = [0; 5];
+    for index in group {
+        counts[tickets[*index].members.len() - 1] += 1;
+    }
+    counts
+}
+
+fn raw_rating_total(group: &[usize], tickets: &[PartyTicket]) -> i64 {
+    group
+        .iter()
+        .flat_map(|index| &tickets[*index].ratings)
+        .map(|rating| i64::from(*rating))
+        .sum()
+}
+
+fn advantage_total(group: &[usize], tickets: &[PartyTicket]) -> i64 {
+    group
+        .iter()
+        .map(|index| {
+            let size = tickets[*index].members.len();
+            i64::from(five_v_five_party_bonus(size)) * size as i64
+        })
+        .sum()
+}
 fn subsets(t: &[PartyTicket], target: usize, budget: usize) -> Vec<Vec<usize>> {
     fn go(
         t: &[PartyTicket],
@@ -17,7 +43,7 @@ fn subsets(t: &[PartyTicket], target: usize, budget: usize) -> Vec<Vec<usize>> {
         }
         for i in at..t.len() {
             let n = t[i].members.len();
-            if n <= left {
+            if (1..=5).contains(&n) && n <= left {
                 c.push(i);
                 go(t, i + 1, left - n, c, out, budget);
                 c.pop();
@@ -37,6 +63,23 @@ pub fn build(t: &[PartyTicket], budget: usize) -> Vec<Candidate> {
                 continue;
             }
             let selected: Vec<_> = a.iter().chain(b).copied().collect();
+            let left_structure = structure(a, t);
+            let right_structure = structure(b, t);
+            if left_structure != right_structure {
+                if !selected
+                    .iter()
+                    .any(|index| t[*index].wait_seconds >= FIVE_V_FIVE_MIRROR_SECONDS)
+                {
+                    continue;
+                }
+                let raw_difference = raw_rating_total(a, t) - raw_rating_total(b, t);
+                let advantage_difference = advantage_total(a, t) - advantage_total(b, t);
+                if advantage_difference > 0 && -raw_difference < advantage_difference
+                    || advantage_difference < 0 && raw_difference < -advantage_difference
+                {
+                    continue;
+                }
+            }
             let minimum = selected
                 .iter()
                 .map(|i| t[*i].effective_rating)
@@ -52,20 +95,20 @@ pub fn build(t: &[PartyTicket], budget: usize) -> Vec<Candidate> {
                 .map(|i| t[*i].search_delta)
                 .min()
                 .unwrap_or_default();
-            if maximum - minimum > allowed {
+            if i64::from(maximum) - i64::from(minimum) > i64::from(allowed) {
                 continue;
             }
             let ta = a.iter().flat_map(|i| t[*i].members.clone()).collect();
             let tb = b.iter().flat_map(|i| t[*i].members.clone()).collect();
             let ar = a
                 .iter()
-                .map(|i| t[*i].effective_rating * t[*i].members.len() as i32)
-                .sum::<i32>()
+                .map(|i| i64::from(t[*i].effective_rating) * t[*i].members.len() as i64)
+                .sum::<i64>()
                 / 5;
             let br = b
                 .iter()
-                .map(|i| t[*i].effective_rating * t[*i].members.len() as i32)
-                .sum::<i32>()
+                .map(|i| i64::from(t[*i].effective_rating) * t[*i].members.len() as i64)
+                .sum::<i64>()
                 / 5;
             let dispersion = a
                 .iter()
@@ -75,10 +118,13 @@ pub fn build(t: &[PartyTicket], budget: usize) -> Vec<Candidate> {
                     party
                         .ratings
                         .iter()
-                        .map(|rating| (*rating - party.effective_rating).abs())
-                        .sum::<i32>()
+                        .map(|rating| {
+                            (i64::from(*rating) - i64::from(party.effective_rating)).abs()
+                        })
+                        .sum::<i64>()
                 })
-                .sum();
+                .sum::<i64>()
+                .min(i64::from(i32::MAX)) as i32;
             out.push(Candidate {
                 tickets: selected.iter().map(|i| t[*i].id).collect(),
                 teams: vec![ta, tb],
@@ -89,9 +135,13 @@ pub fn build(t: &[PartyTicket], budget: usize) -> Vec<Candidate> {
                     .min()
                     .unwrap_or(0),
                 quality_key: (
-                    (ar - br).abs(),
+                    (ar - br).abs().min(i64::from(i32::MAX)) as i32,
                     dispersion,
-                    (a.len() as i32 - b.len() as i32).abs(),
+                    left_structure
+                        .iter()
+                        .zip(right_structure)
+                        .map(|(left, right)| (i32::from(*left) - i32::from(right)).abs())
+                        .sum(),
                 ),
                 owner_shard: 0,
             });

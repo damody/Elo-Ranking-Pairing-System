@@ -144,7 +144,7 @@ mod tests {
         assert_eq!(x, y);
     }
     #[test]
-    fn older_candidate_can_outrank_soft_party_structure_penalty() {
+    fn older_candidate_can_outrank_quality_penalty() {
         let older = Candidate {
             tickets: vec![TicketId::new()],
             teams: vec![],

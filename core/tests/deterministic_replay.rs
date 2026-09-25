@@ -17,6 +17,7 @@ fn fixture() -> CandidateSnapshot {
                 region: "tw".into(),
                 mode: QueueMode::OneVsOne,
                 search_delta: 100,
+                wait_seconds: 0,
             })
             .collect(),
     )
