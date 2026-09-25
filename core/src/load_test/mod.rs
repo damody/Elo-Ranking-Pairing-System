@@ -141,6 +141,8 @@ pub struct ScenarioSettings {
     pub server_capacity_range: [u32; 2],
     pub server_instance_range: [u16; 2],
     pub rating_range: [i32; 2],
+    pub five_v_five_mirror_seconds: u64,
+    pub five_v_five_party_bonuses: [i32; 4],
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -241,6 +243,30 @@ fn push_mode(
         let mut left = match_size;
         let base_rating = 900 + rng.range(1001) as i32;
         let region = ["tw", "us", "eu"][rng.range(3)].to_owned();
+        if group == 10 && match_size == 10 {
+            let mut team_sizes = Vec::new();
+            let mut team_left = 5;
+            while team_left > 0 {
+                let size = (1 + rng.range(max_party)).min(team_left);
+                team_sizes.push(size);
+                team_left -= size;
+            }
+            for _ in 0..2 {
+                for size in &team_sizes {
+                    parties.push(Party {
+                        id: PartyId::from_uuid(uuid::Uuid::from_u128(rng.next() as u128)),
+                        mode,
+                        players: (0..*size)
+                            .map(|_| PlayerId::from_uuid(uuid::Uuid::from_u128(rng.next() as u128)))
+                            .collect(),
+                        rating: base_rating + rng.range(201) as i32 - 100,
+                        region: region.clone(),
+                    });
+                }
+            }
+            players -= match_size;
+            continue;
+        }
         while left > 0 {
             let consumed = match_size - left;
             let structural_limit = if group == 10 {
@@ -409,12 +435,17 @@ fn candidate_for(
             party: party.id,
             members: party.players.clone(),
             ratings: vec![party.rating; party.players.len()],
-            effective_rating: party.rating,
+            effective_rating: if mode == QueueMode::FiveVsFive {
+                party.rating + crate::matching::five_v_five_party_bonus(party.players.len())
+            } else {
+                party.rating
+            },
             enqueued_at: index as u64,
             revision: 1,
             region: party.region.clone(),
             mode,
             search_delta: 600,
+            wait_seconds: 0,
         })
         .collect();
     let snapshot = CandidateSnapshot::new(tickets);
@@ -687,6 +718,8 @@ pub fn run(config: ScenarioConfig) -> Result<LoadReport, String> {
             server_capacity_range: [100, 999],
             server_instance_range: [1, 100],
             rating_range: [800, 2000],
+            five_v_five_mirror_seconds: crate::matching::FIVE_V_FIVE_MIRROR_SECONDS,
+            five_v_five_party_bonuses: crate::matching::FIVE_V_FIVE_PARTY_BONUSES,
         },
         baseline: None,
         transport: None,
@@ -747,6 +780,22 @@ fn validate_grpc_launch(
             {
                 return Err("gRPC launch split a 5v5 party across teams".into());
             }
+        }
+        let structures = launch
+            .teams
+            .iter()
+            .map(|team| {
+                let mut sizes = parties
+                    .iter()
+                    .filter(|party| party.iter().all(|player| team.player_ids.contains(player)))
+                    .map(Vec::len)
+                    .collect::<Vec<_>>();
+                sizes.sort_unstable();
+                sizes
+            })
+            .collect::<Vec<_>>();
+        if structures[0] != structures[1] {
+            return Err("gRPC launch 5v5 party structures do not mirror".into());
         }
     }
     Ok(())
@@ -1216,6 +1265,26 @@ mod tests {
                 QueueMode::FiveVsFive => 5,
                 QueueMode::FreeForAll => 4,
             }));
+        let five_v_five = p
+            .iter()
+            .filter(|party| party.mode == QueueMode::FiveVsFive)
+            .collect::<Vec<_>>();
+        let mut at = 0;
+        while at < five_v_five.len() {
+            let mut teams = [Vec::new(), Vec::new()];
+            for team in &mut teams {
+                let mut players = 0;
+                while players < 5 {
+                    let size = five_v_five[at].players.len();
+                    team.push(size);
+                    players += size;
+                    at += 1;
+                }
+                assert_eq!(players, 5);
+                team.sort_unstable();
+            }
+            assert_eq!(teams[0], teams[1]);
+        }
     }
     #[test]
     fn baseline_comparison_rejects_different_environment_or_settings() {
@@ -1281,6 +1350,44 @@ mod tests {
         assert_eq!(
             validate_grpc_launch(QueueMode::FiveVsFive, &foreign, &parties).unwrap_err(),
             "gRPC launch roster contains missing, duplicate, or foreign players"
+        );
+    }
+
+    #[test]
+    fn grpc_launch_checker_rejects_fresh_mismatched_party_structures() {
+        let parties = vec![
+            vec!["a", "b", "c", "d"],
+            vec!["e"],
+            vec!["f", "g"],
+            vec!["h", "i"],
+            vec!["j"],
+        ]
+        .into_iter()
+        .map(|party| party.into_iter().map(str::to_owned).collect())
+        .collect::<Vec<Vec<String>>>();
+        let launch = pb::LaunchMatch {
+            mode: pb::QueueMode::FiveVFive as i32,
+            teams: vec![
+                pb::Team {
+                    team_index: 0,
+                    player_ids: ["a", "b", "c", "d", "e"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                },
+                pb::Team {
+                    team_index: 1,
+                    player_ids: ["f", "g", "h", "i", "j"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_grpc_launch(QueueMode::FiveVsFive, &launch, &parties).unwrap_err(),
+            "gRPC launch 5v5 party structures do not mirror"
         );
     }
 
